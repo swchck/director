@@ -1,0 +1,116 @@
+version: "3"
+
+vars:
+  DIRECTUS_URL: "http://localhost:8055"
+  DIRECTUS_TOKEN: "e2e-test-token"
+  DATABASE_URL: "postgres://directus:directus@localhost:5433/directus?sslmode=disable"
+  REDIS_URL: "localhost:6379"
+
+tasks:
+  up:
+    desc: Start all services (Directus, Postgres, Redis)
+    cmds:
+      - docker compose up -d
+      - task: wait-healthy
+
+  down:
+    desc: Stop all services
+    cmds:
+      - docker compose down
+
+  clean:
+    desc: Stop all services and remove volumes
+    cmds:
+      - docker compose down -v
+
+  restart:
+    desc: Clean restart — remove volumes and start fresh
+    cmds:
+      - task: clean
+      - task: up
+
+  wait-healthy:
+    desc: Wait for Directus to be healthy
+    cmds:
+      - |
+        echo "Waiting for Directus to be ready..."
+        for i in $(seq 1 60); do
+          if curl -sf http://localhost:8055/server/health > /dev/null 2>&1; then
+            echo "Directus is ready!"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "Timed out waiting for Directus"
+        exit 1
+
+  logs:
+    desc: Show service logs
+    cmds:
+      - docker compose logs -f {{.CLI_ARGS}}
+
+  test:
+    desc: Run unit tests
+    cmds:
+      - go test -race -count=1 ./...
+
+  test:e2e:
+    desc: Run e2e tests against real Directus (services must be running)
+    env:
+      DIRECTUS_URL: "{{.DIRECTUS_URL}}"
+      DIRECTUS_TOKEN: "{{.DIRECTUS_TOKEN}}"
+      DATABASE_URL: "{{.DATABASE_URL}}"
+      REDIS_URL: "{{.REDIS_URL}}"
+    cmds:
+      - go test -race -count=1 -tags=e2e -timeout=120s ./e2e/...
+
+  test:all:
+    desc: Run all tests (unit + e2e)
+    cmds:
+      - task: test
+      - task: test:e2e
+
+  e2e:
+    desc: Full e2e cycle — start services, run tests, stop
+    cmds:
+      - task: restart
+      - defer: { task: down }
+      - task: test:e2e
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  build:
+    desc: Build all packages
+    cmds:
+      - go build ./...
+
+  test:cover:
+    desc: Run tests with coverage report
+    cmds:
+      - go test -race -coverprofile=coverage.out ./config/... ./directus/... ./manager/... ./cache/... ./log/... ./source/... ./notify/... ./registry/... ./storage/...
+      - go tool cover -func=coverage.out | tail -1
+
+  test:cover:html:
+    desc: Open coverage report in browser
+    deps: [test:cover]
+    cmds:
+      - go tool cover -html=coverage.out
+
+  lint:
+    desc: Run all static checks (vet + build + test)
+    cmds:
+      - task: build
+      - task: vet
+      - task: test
+
+  example:full-setup:
+    desc: Run the full-setup example (services must be running)
+    env:
+      DIRECTUS_URL: "{{.DIRECTUS_URL}}"
+      DIRECTUS_TOKEN: "{{.DIRECTUS_TOKEN}}"
+      DATABASE_URL: "{{.DATABASE_URL}}"
+    cmds:
+      - go run ./example/10-full-setup/...

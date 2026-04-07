@@ -1,0 +1,12 @@
+# Test artifacts
+coverage.out
+*.test
+
+# IDE / Editor
+.idea/
+.vscode/
+.zed/
+
+# OS
+.DS_Store
+Thumbs.db

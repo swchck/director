@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate semver tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if ! echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "::error::Tag '$TAG' is not valid semver (expected vX.Y.Z or vX.Y.Z-pre)"
+            exit 1
+          fi
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+
+      - name: Verify build
+        run: go build ./...
+
+      - name: Verify tests
+        run: go test -race -count=1 ./...
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+
+      - name: Warm Go module proxy
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          MODULE="github.com/swchck/director"
+          curl -sf "https://proxy.golang.org/${MODULE}/@v/${TAG}.info" > /dev/null || true
+          echo "Requested proxy cache for ${MODULE}@${TAG}"
