@@ -35,6 +35,8 @@ Generic typed wrapper for multi-item collections. Methods:
 
 `MaxDateUpdated` is the lightweight version-check call -- fetches a single field from one row.
 
+> **Important:** For polling-based sync to detect changes, collections must have `date_updated` (and/or `date_created`) system fields enabled in Directus. These fields are used as the version signal. If neither field exists, `MaxDateUpdated` returns zero time — meaning polling will never detect changes after the initial fetch. WebSocket-triggered syncs still work because they bypass version comparison. Use `DateCreatedField()` and `DateUpdatedField()` helpers when creating collections programmatically.
+
 ### Singleton[T] (`singleton.go`)
 
 For Directus singleton collections (one object, no array):
@@ -44,6 +46,8 @@ For Directus singleton collections (one object, no array):
 | `Get(ctx, ...QueryOption)` | GET | `/items/{collection}` |
 | `Update(ctx, item)` | PATCH | `/items/{collection}` |
 | `DateUpdated(ctx)` | GET | `/items/{collection}?fields=date_updated` |
+
+> Same requirement applies to singletons: `date_updated`/`date_created` fields must exist for polling to detect changes.
 
 ### Filter & Query Builder (`filter.go`)
 

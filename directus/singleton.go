@@ -73,18 +73,15 @@ func (s *Singleton[T]) Update(ctx context.Context, item *T) (*T, error) {
 func (s *Singleton[T]) DateUpdated(ctx context.Context) (time.Time, error) {
 	// Try date_updated first.
 	t, err := s.fetchTimestamp(ctx, "date_updated")
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	if !t.IsZero() {
+	if err == nil && !t.IsZero() {
 		return t, nil
 	}
+	// Field might not exist (403/400) or have no value — fall through.
 
 	// Fallback: date_created.
 	t, err = s.fetchTimestamp(ctx, "date_created")
 	if err != nil {
-		// Field might not exist — not fatal.
+		// Field might not exist either — not fatal.
 		return time.Time{}, nil
 	}
 
