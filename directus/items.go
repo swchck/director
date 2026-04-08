@@ -116,18 +116,16 @@ func (i *Items[T]) Delete(ctx context.Context, id string) error {
 func (i *Items[T]) MaxDateUpdated(ctx context.Context) (time.Time, error) {
 	// First try: max(date_updated).
 	t, err := i.fetchMaxTimestamp(ctx, "date_updated")
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	if !t.IsZero() {
+	if err == nil && !t.IsZero() {
 		return t, nil
 	}
+	// Field might not exist (403/400) or have no values — fall through.
 
-	// Fallback: max(date_created) — for items that were created but never updated.
+	// Fallback: max(date_created) — for items that were created but never updated,
+	// or when date_updated field doesn't exist in the schema.
 	t, err = i.fetchMaxTimestamp(ctx, "date_created")
 	if err != nil {
-		// date_created field might not exist — not an error, just return zero.
+		// date_created field might not exist either — not an error, just return zero.
 		return time.Time{}, nil
 	}
 

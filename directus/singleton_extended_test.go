@@ -123,12 +123,47 @@ func TestSingleton_Update_Error(t *testing.T) {
 	}
 }
 
-func TestSingleton_DateUpdated_Error(t *testing.T) {
+func TestSingleton_DateUpdated_FieldForbidden_FallsBackToDateCreated(t *testing.T) {
+	now := time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	srv := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		fields := r.URL.Query().Get("fields")
+
+		switch fields {
+		case "date_updated":
+			// 403 — field not accessible / doesn't exist
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(403)
+			json.NewEncoder(w).Encode(map[string]any{
+				"errors": []map[string]any{{"message": "forbidden"}},
+			})
+		case "date_created":
+			writeJSONData(w, map[string]any{
+				"date_created": now.Format(time.RFC3339),
+			})
+		}
+	})
+	defer srv.Close()
+
+	client := directus.NewClient(srv.URL, "token")
+	s := directus.NewSingleton[testSettings](client, "settings")
+
+	got, err := s.DateUpdated(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v (should fallback on 403)", err)
+	}
+
+	if !got.Equal(now) {
+		t.Errorf("got %v, want %v", got, now)
+	}
+}
+
+func TestSingleton_DateUpdated_BothFieldsMissing_ReturnsZero(t *testing.T) {
 	srv := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(500)
+		w.WriteHeader(403)
 		json.NewEncoder(w).Encode(map[string]any{
-			"errors": []map[string]any{{"message": "internal error"}},
+			"errors": []map[string]any{{"message": "forbidden"}},
 		})
 	})
 	defer srv.Close()
@@ -136,9 +171,13 @@ func TestSingleton_DateUpdated_Error(t *testing.T) {
 	client := directus.NewClient(srv.URL, "token")
 	s := directus.NewSingleton[testSettings](client, "settings")
 
-	_, err := s.DateUpdated(context.Background())
-	if err == nil {
-		t.Fatal("expected error")
+	got, err := s.DateUpdated(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v (both fields missing should return zero)", err)
+	}
+
+	if !got.IsZero() {
+		t.Errorf("expected zero time, got %v", got)
 	}
 }
 
@@ -179,6 +218,41 @@ func TestItems_MaxDateUpdated_FallsBackToDateCreated(t *testing.T) {
 
 	if callCount != 2 {
 		t.Errorf("expected 2 calls, got %d", callCount)
+	}
+}
+
+func TestItems_MaxDateUpdated_FieldForbidden_FallsBackToDateCreated(t *testing.T) {
+	now := time.Date(2025, 3, 15, 10, 0, 0, 0, time.UTC)
+
+	srv := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		sort := r.URL.Query().Get("sort")
+
+		switch sort {
+		case "-date_updated":
+			// 403 — field not accessible / doesn't exist
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(403)
+			json.NewEncoder(w).Encode(map[string]any{
+				"errors": []map[string]any{{"message": "forbidden"}},
+			})
+		case "-date_created":
+			writeJSONData(w, []map[string]any{
+				{"date_created": now.Format(time.RFC3339)},
+			})
+		}
+	})
+	defer srv.Close()
+
+	client := directus.NewClient(srv.URL, "token")
+	items := directus.NewItems[testItem](client, "test_items")
+
+	got, err := items.MaxDateUpdated(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v (should fallback on 403)", err)
+	}
+
+	if !got.Equal(now) {
+		t.Errorf("got %v, want %v", got, now)
 	}
 }
 
