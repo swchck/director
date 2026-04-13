@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -101,15 +102,14 @@ func (s *twoPCSource) LastModified(_ context.Context) (time.Time, error) {
 	return s.lastModified, nil
 }
 
-// buildManager wires a manager with 2PC enabled, a leader instance ID,
-// and the provided registry/notifier. The source and collection are returned
-// so tests can assert end-state.
+// buildManager wires a manager with 2PC enabled (instance ID "leader") and
+// the provided registry/notifier. The source and collection are returned so
+// tests can assert end-state.
 func build2PCManager(
 	t *testing.T,
 	store *mockStorage,
 	notif *twoPCNotifier,
 	reg *twoPCRegistry,
-	instanceID string,
 	src *twoPCSource,
 ) (*manager.Manager, *config.Collection[twoPCArticle]) {
 	t.Helper()
@@ -123,7 +123,7 @@ func build2PCManager(
 		ServiceName:              "test-svc",
 		RequireUnanimousApply:    true,
 	},
-		manager.WithInstanceID(instanceID),
+		manager.WithInstanceID("leader"),
 	)
 
 	manager.RegisterCollectionSource(mgr, articles, src)
@@ -157,7 +157,7 @@ func TestTwoPC_HappyPath(t *testing.T) {
 		}()
 	}
 
-	mgr, articles := build2PCManager(t, store, notif, reg, "leader", src)
+	mgr, articles := build2PCManager(t, store, notif, reg, src)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -214,7 +214,7 @@ func TestTwoPC_AbortsOnPrepareFailed(t *testing.T) {
 		}()
 	}
 
-	mgr, articles := build2PCManager(t, store, notif, reg, "leader", src)
+	mgr, articles := build2PCManager(t, store, notif, reg, src)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -279,7 +279,7 @@ func TestTwoPC_AbortsOnTimeout(t *testing.T) {
 
 	notif := newTwoPCNotifier() // no onPublish → follower never responds
 
-	mgr, articles := build2PCManager(t, store, notif, reg, "leader", src)
+	mgr, articles := build2PCManager(t, store, notif, reg, src)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -341,7 +341,7 @@ func TestTwoPC_FollowerDropoutCompletes(t *testing.T) {
 		}()
 	}
 
-	mgr, articles := build2PCManager(t, store, notif, reg, "leader", src)
+	mgr, articles := build2PCManager(t, store, notif, reg, src)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -472,12 +472,7 @@ func TestTwoPC_FollowerPrepareAndCommit(t *testing.T) {
 	// Wait for follower to log "prepared".
 	waitFor(t, 2*time.Second, func() bool {
 		ids, _ := store.AppliedInstances(ctx, "articles", version, "prepared")
-		for _, id := range ids {
-			if id == "solo-follower" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(ids, "solo-follower")
 	})
 
 	// Data must NOT be applied yet.
@@ -1121,7 +1116,7 @@ func TestTwoPC_PublishCommitFailure_LeaderStillCommits(t *testing.T) {
 		return nil
 	}
 
-	mgr, articles := build2PCManager(t, store, notif, reg, "leader", src)
+	mgr, articles := build2PCManager(t, store, notif, reg, src)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

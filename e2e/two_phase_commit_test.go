@@ -23,9 +23,16 @@ import (
 // flakyStorage wraps a real storage and lets a test fail GetSnapshot for one
 // specific instance (simulating a follower that can't load the snapshot
 // during 2PC prepare — a realistic prepare-time failure mode).
+//
+// neverLeader, when true, makes AcquireLock always return ErrLockNotAcquired
+// so this instance is pinned as a follower. Without this, after the leader's
+// round aborts the lock is released and the "broken" replica can take
+// leadership on the next poll cycle — where a leader uses fetchAndStage
+// (source path) and bypasses the flaky GetSnapshot entirely, masking the bug.
 type flakyStorage struct {
 	storage.Storage
 	failGetSnapshot atomic.Bool
+	neverLeader     atomic.Bool
 }
 
 func (s *flakyStorage) GetSnapshot(ctx context.Context, collection, version string) (*storage.Snapshot, error) {
@@ -33,6 +40,13 @@ func (s *flakyStorage) GetSnapshot(ctx context.Context, collection, version stri
 		return nil, errors.New("flakyStorage: simulated GetSnapshot failure")
 	}
 	return s.Storage.GetSnapshot(ctx, collection, version)
+}
+
+func (s *flakyStorage) AcquireLock(ctx context.Context, key int64) (func(), error) {
+	if s.neverLeader.Load() {
+		return nil, storage.ErrLockNotAcquired
+	}
+	return s.Storage.AcquireLock(ctx, key)
 }
 
 // e2eTPCArticle is the payload for 2PC e2e tests.
@@ -274,8 +288,10 @@ func TestE2E_TwoPhaseCommit_AbortOnBrokenReplica(t *testing.T) {
 	}
 	v1 := cfgA.Version()
 
-	// Break replica B's storage read and publish v2.
+	// Break replica B's storage read and pin B as follower so it can't take
+	// leadership on the next poll cycle (which would bypass GetSnapshot).
 	flakyB.failGetSnapshot.Store(true)
+	flakyB.neverLeader.Store(true)
 	now2 := now.Add(time.Hour)
 	src.update([]e2eTPCArticle{
 		{ID: 1, Name: "v2", Score: 1},
@@ -305,6 +321,7 @@ func TestE2E_TwoPhaseCommit_AbortOnBrokenReplica(t *testing.T) {
 
 	// Recover B and re-trigger. Bump the version forward so the leader actually re-syncs.
 	flakyB.failGetSnapshot.Store(false)
+	flakyB.neverLeader.Store(false)
 	now3 := now2.Add(time.Hour)
 	src.update([]e2eTPCArticle{
 		{ID: 1, Name: "v3", Score: 1},
