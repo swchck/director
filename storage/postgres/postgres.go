@@ -182,6 +182,46 @@ func (s *Storage) CountApplied(ctx context.Context, collection, version string) 
 	return count, nil
 }
 
+// ResetApplyLog deletes all apply-log rows for (collection, version).
+func (s *Storage) ResetApplyLog(ctx context.Context, collection, version string) error {
+	const query = `DELETE FROM director.config_apply_log WHERE collection_name = $1 AND version = $2`
+	if _, err := s.pool.Exec(ctx, query, collection, version); err != nil {
+		return fmt.Errorf("storage/postgres: reset apply log %s/%s: %w", collection, version, err)
+	}
+	return nil
+}
+
+// AppliedInstances returns the instance IDs that logged the given status
+// for (collection, version).
+func (s *Storage) AppliedInstances(ctx context.Context, collection, version, status string) ([]string, error) {
+	const query = `
+		SELECT instance_id
+		FROM director.config_apply_log
+		WHERE collection_name = $1 AND version = $2 AND status = $3
+		ORDER BY instance_id`
+
+	rows, err := s.pool.Query(ctx, query, collection, version, status)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: applied instances %s/%s/%s: %w", collection, version, status, err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("storage/postgres: applied instances scan %s/%s: %w", collection, version, err)
+		}
+		ids = append(ids, id)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage/postgres: applied instances iter %s/%s: %w", collection, version, err)
+	}
+
+	return ids, nil
+}
+
 // AcquireLock attempts to acquire a Postgres session-level advisory lock.
 // Returns a release function if acquired. The caller must call release when done.
 // Returns storage.ErrLockNotAcquired if the lock is already held by another session.

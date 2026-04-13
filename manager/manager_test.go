@@ -3,6 +3,7 @@ package manager_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -20,16 +21,18 @@ import (
 // Mock implementations
 
 type mockStorage struct {
-	mu        sync.Mutex
-	snapshots map[string]*storage.Snapshot
-	applyLog  map[string]int
-	lockHeld  bool
+	mu           sync.Mutex
+	snapshots    map[string]*storage.Snapshot
+	applyLog     map[string]int                // key = collection:version, counts "applied" only
+	applyByStat  map[string]map[string][]string // key = collection:version:status -> []instanceID
+	lockHeld     bool
 }
 
 func newMockStorage() *mockStorage {
 	return &mockStorage{
-		snapshots: make(map[string]*storage.Snapshot),
-		applyLog:  make(map[string]int),
+		snapshots:   make(map[string]*storage.Snapshot),
+		applyLog:    make(map[string]int),
+		applyByStat: make(map[string]map[string][]string),
 	}
 }
 
@@ -107,7 +110,7 @@ func (s *mockStorage) FailSnapshot(_ context.Context, collection, version string
 	return nil
 }
 
-func (s *mockStorage) LogApply(_ context.Context, _, collection, version, status string) error {
+func (s *mockStorage) LogApply(_ context.Context, instanceID, collection, version, status string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -115,6 +118,22 @@ func (s *mockStorage) LogApply(_ context.Context, _, collection, version, status
 		key := collection + ":" + version
 		s.applyLog[key]++
 	}
+
+	cvKey := collection + ":" + version
+	if s.applyByStat[cvKey] == nil {
+		s.applyByStat[cvKey] = make(map[string][]string)
+	}
+	// Remove this instance from other statuses for this (collection, version) — upsert semantics.
+	for st, ids := range s.applyByStat[cvKey] {
+		filtered := ids[:0]
+		for _, id := range ids {
+			if id != instanceID {
+				filtered = append(filtered, id)
+			}
+		}
+		s.applyByStat[cvKey][st] = filtered
+	}
+	s.applyByStat[cvKey][status] = append(s.applyByStat[cvKey][status], instanceID)
 
 	return nil
 }
@@ -125,6 +144,26 @@ func (s *mockStorage) CountApplied(_ context.Context, collection, version string
 
 	key := collection + ":" + version
 	return s.applyLog[key], nil
+}
+
+func (s *mockStorage) AppliedInstances(_ context.Context, collection, version, status string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cvKey := collection + ":" + version
+	ids := s.applyByStat[cvKey][status]
+	out := make([]string, len(ids))
+	copy(out, ids)
+	return out, nil
+}
+
+func (s *mockStorage) ResetApplyLog(_ context.Context, collection, version string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cvKey := collection + ":" + version
+	delete(s.applyByStat, cvKey)
+	delete(s.applyLog, cvKey)
+	return nil
 }
 
 func (s *mockStorage) AcquireLock(_ context.Context, _ int64) (func(), error) {
@@ -190,8 +229,9 @@ func (n *mockNotifier) publishedEvents() []notify.Event {
 }
 
 type mockRegistry struct {
-	mu    sync.Mutex
-	count int
+	mu        sync.Mutex
+	count     int
+	instances []string // if empty, derived from count as ["self"] etc.
 }
 
 func newMockRegistry() *mockRegistry {
@@ -207,6 +247,24 @@ func (r *mockRegistry) AliveCount(_ context.Context, _ string) (int, error) {
 	defer r.mu.Unlock()
 
 	return r.count, nil
+}
+
+func (r *mockRegistry) AliveInstances(_ context.Context, _ string) ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.instances) > 0 {
+		out := make([]string, len(r.instances))
+		copy(out, r.instances)
+		return out, nil
+	}
+
+	// Fallback: synthesize ids matching count so old tests keep working.
+	out := make([]string, 0, r.count)
+	for i := 0; i < r.count; i++ {
+		out = append(out, fmt.Sprintf("mock-instance-%d", i))
+	}
+	return out, nil
 }
 
 // Tests

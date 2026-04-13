@@ -46,6 +46,33 @@ type Options struct {
 	// ServiceName identifies this service in the instance registry.
 	// Required.
 	ServiceName string
+
+	// RequireUnanimousApply enables two-phase commit (2PC) for config sync.
+	//
+	// When true, a new version is committed only if every alive replica
+	// (snapshotted at the start of the round) successfully stages it in the
+	// prepare phase. If any replica reports prepare_failed or does not
+	// respond within WaitConfirmationsTimeout, the round is aborted —
+	// nobody swaps — and the leader retries on the next poll/WS cycle.
+	//
+	// This guarantees the cluster-wide invariant that all alive replicas
+	// operate on the same config version (with a small skew window of a
+	// few seconds during the commit phase), at the cost of availability:
+	// a single chronically-broken replica blocks all config updates.
+	//
+	// All replicas of the same service must use the same value for this
+	// option — mixed-mode clusters are not supported.
+	//
+	// Default: false (eventually-consistent behavior).
+	RequireUnanimousApply bool
+
+	// PrepareTTL bounds how long a follower holds a staged snapshot in
+	// memory while waiting for commit/abort from the leader. After the
+	// TTL expires, the staged snapshot is dropped; a subsequent commit
+	// for the same round falls back to re-loading from storage.
+	// Applies only when RequireUnanimousApply is true.
+	// Default: 2 × WaitConfirmationsTimeout.
+	PrepareTTL time.Duration
 }
 
 func (o Options) withDefaults() Options {
@@ -73,6 +100,10 @@ func (o Options) withDefaults() Options {
 
 	if o.AdvisoryLockKey == 0 {
 		o.AdvisoryLockKey = defaultAdvisoryLockKey
+	}
+
+	if o.PrepareTTL <= 0 {
+		o.PrepareTTL = 2 * o.WaitConfirmationsTimeout
 	}
 
 	return o

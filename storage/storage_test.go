@@ -11,16 +11,18 @@ import (
 )
 
 type memoryStorage struct {
-	mu        sync.Mutex
-	snapshots map[string]*storage.Snapshot // key = collection:version
-	applyLog  map[string]int               // key = collection:version
-	lockHeld  bool
+	mu          sync.Mutex
+	snapshots   map[string]*storage.Snapshot    // key = collection:version
+	applyLog    map[string]int                  // key = collection:version (status=applied only)
+	applyByStat map[string]map[string][]string  // key = collection:version -> status -> []instanceID
+	lockHeld    bool
 }
 
 func newMemoryStorage() *memoryStorage {
 	return &memoryStorage{
-		snapshots: make(map[string]*storage.Snapshot),
-		applyLog:  make(map[string]int),
+		snapshots:   make(map[string]*storage.Snapshot),
+		applyLog:    make(map[string]int),
+		applyByStat: make(map[string]map[string][]string),
 	}
 }
 
@@ -101,7 +103,7 @@ func (s *memoryStorage) FailSnapshot(_ context.Context, collection, version stri
 	return nil
 }
 
-func (s *memoryStorage) LogApply(_ context.Context, _, collection, version, status string) error {
+func (s *memoryStorage) LogApply(_ context.Context, instanceID, collection, version, status string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -109,6 +111,21 @@ func (s *memoryStorage) LogApply(_ context.Context, _, collection, version, stat
 		key := collection + ":" + version
 		s.applyLog[key]++
 	}
+
+	cvKey := collection + ":" + version
+	if s.applyByStat[cvKey] == nil {
+		s.applyByStat[cvKey] = make(map[string][]string)
+	}
+	for st, ids := range s.applyByStat[cvKey] {
+		filtered := ids[:0]
+		for _, id := range ids {
+			if id != instanceID {
+				filtered = append(filtered, id)
+			}
+		}
+		s.applyByStat[cvKey][st] = filtered
+	}
+	s.applyByStat[cvKey][status] = append(s.applyByStat[cvKey][status], instanceID)
 
 	return nil
 }
@@ -119,6 +136,26 @@ func (s *memoryStorage) CountApplied(_ context.Context, collection, version stri
 
 	key := collection + ":" + version
 	return s.applyLog[key], nil
+}
+
+func (s *memoryStorage) AppliedInstances(_ context.Context, collection, version, status string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cvKey := collection + ":" + version
+	ids := s.applyByStat[cvKey][status]
+	out := make([]string, len(ids))
+	copy(out, ids)
+	return out, nil
+}
+
+func (s *memoryStorage) ResetApplyLog(_ context.Context, collection, version string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cvKey := collection + ":" + version
+	delete(s.applyByStat, cvKey)
+	delete(s.applyLog, cvKey)
+	return nil
 }
 
 func (s *memoryStorage) AcquireLock(_ context.Context, _ int64) (func(), error) {

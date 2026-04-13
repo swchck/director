@@ -58,6 +58,17 @@ type Storage interface {
 	// CountApplied returns the number of instances that successfully applied a version.
 	CountApplied(ctx context.Context, collection, version string) (int, error)
 
+	// AppliedInstances returns the instance IDs that logged the given status
+	// for (collection, version). Used by the 2PC protocol to track which
+	// specific instances have prepared/committed a version.
+	AppliedInstances(ctx context.Context, collection, version, status string) ([]string, error)
+
+	// ResetApplyLog deletes all apply-log rows for (collection, version).
+	// Called by the 2PC leader at the start of each round so that stale
+	// statuses from a prior aborted round do not leak into the new round's
+	// quorum check. The advisory lock serializes leaders, so this is safe.
+	ResetApplyLog(ctx context.Context, collection, version string) error
+
 	// AcquireLock attempts to acquire a distributed lock.
 	// If acquired, returns a release function. The caller must call release when done.
 	// Returns ErrLockNotAcquired if the lock is already held.
