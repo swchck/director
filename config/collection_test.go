@@ -219,3 +219,72 @@ func TestCollection_ConcurrentReadsDuringSwap(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// TestCollection_OnChange_Unsubscribe verifies the function returned by
+// OnChange removes the hook so it stops firing on subsequent Swap calls.
+// Documented in CHANGELOG: "OnChange on all types now returns an unsubscribe function".
+func TestCollection_OnChange_Unsubscribe(t *testing.T) {
+	c := config.NewCollection[item]("things")
+
+	var hookACalls, hookBCalls int
+
+	unsubA := c.OnChange(func(_, _ []item) { hookACalls++ })
+	c.OnChange(func(_, _ []item) { hookBCalls++ })
+
+	if err := c.Swap(v1(), []item{{ID: 1}}); err != nil {
+		t.Fatalf("Swap v1: %v", err)
+	}
+	if hookACalls != 1 || hookBCalls != 1 {
+		t.Fatalf("after v1: hookA=%d hookB=%d, want 1/1", hookACalls, hookBCalls)
+	}
+
+	// Unsubscribe A — only B should fire on the next swap.
+	unsubA()
+
+	if err := c.Swap(v2(), []item{{ID: 2}}); err != nil {
+		t.Fatalf("Swap v2: %v", err)
+	}
+	if hookACalls != 1 {
+		t.Errorf("hookA fired after unsubscribe: hookACalls=%d, want 1", hookACalls)
+	}
+	if hookBCalls != 2 {
+		t.Errorf("hookB calls = %d, want 2", hookBCalls)
+	}
+
+	// Calling unsubscribe twice must be safe (idempotent).
+	unsubA()
+
+	if err := c.Swap(v2(), []item{{ID: 3}}); err != nil {
+		t.Fatalf("Swap v3: %v", err)
+	}
+	if hookACalls != 1 {
+		t.Errorf("hookA fired after double-unsubscribe: hookACalls=%d, want 1", hookACalls)
+	}
+	if hookBCalls != 3 {
+		t.Errorf("hookB calls = %d, want 3", hookBCalls)
+	}
+}
+
+// TestSingleton_OnChange_Unsubscribe is the singleton counterpart.
+func TestSingleton_OnChange_Unsubscribe(t *testing.T) {
+	s := config.NewSingleton[item]("only")
+
+	var calls int
+	unsub := s.OnChange(func(_, _ *item) { calls++ })
+
+	if err := s.Swap(v1(), item{ID: 1}); err != nil {
+		t.Fatalf("Swap v1: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("after v1: calls=%d, want 1", calls)
+	}
+
+	unsub()
+
+	if err := s.Swap(v2(), item{ID: 2}); err != nil {
+		t.Fatalf("Swap v2: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("hook fired after unsubscribe: calls=%d, want 1", calls)
+	}
+}

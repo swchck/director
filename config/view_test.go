@@ -3,8 +3,11 @@ package config_test
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -501,5 +504,147 @@ func TestView_WithErrorHandler(t *testing.T) {
 
 	if capturedErr == nil {
 		t.Error("expected error to be captured")
+	}
+}
+
+// slowPersistence blocks Save until ctx is cancelled, so the test can verify
+// that WithPersistenceTimeout actually cancels the Save context.
+type slowPersistence struct {
+	saveCalls atomic.Int32
+	saveErr   chan error // receives the error that Save observed
+}
+
+func newSlowPersistence() *slowPersistence {
+	return &slowPersistence{saveErr: make(chan error, 4)}
+}
+
+func (s *slowPersistence) Save(ctx context.Context, _ string, _ []byte) error {
+	s.saveCalls.Add(1)
+	<-ctx.Done()
+	err := ctx.Err()
+	select {
+	case s.saveErr <- err:
+	default:
+	}
+	return err
+}
+
+func (s *slowPersistence) Load(_ context.Context, _ string) ([]byte, error) {
+	return nil, nil
+}
+
+// TestView_WithPersistenceTimeout_FiresOnSlowSave verifies that the timeout
+// configured via WithPersistenceTimeout cancels the Save context and that the
+// resulting error reaches the registered error handler.
+func TestView_WithPersistenceTimeout_FiresOnSlowSave(t *testing.T) {
+	store := newSlowPersistence()
+
+	var (
+		errMu     sync.Mutex
+		captured  error
+		callCount int
+	)
+
+	c := config.NewCollection[item]("items")
+	_ = c.Swap(v1(), []item{{ID: 1}})
+
+	_ = config.NewView("timeout-view", c, nil,
+		config.WithPersistence[item](store),
+		config.WithPersistenceTimeout[item](80*time.Millisecond),
+		config.WithErrorHandler[item](func(_ string, err error) {
+			errMu.Lock()
+			defer errMu.Unlock()
+			callCount++
+			captured = err
+		}),
+	)
+
+	// Wait for the slow Save to time out and surface the error.
+	select {
+	case observed := <-store.saveErr:
+		if !errors.Is(observed, context.DeadlineExceeded) {
+			t.Errorf("Save context error = %v, want context.DeadlineExceeded", observed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Save did not observe ctx cancellation within 2s")
+	}
+
+	// Allow the error to flow back to the handler.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		errMu.Lock()
+		got := captured
+		errMu.Unlock()
+		if got != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	errMu.Lock()
+	defer errMu.Unlock()
+	if captured == nil {
+		t.Fatal("error handler was not invoked after Save timeout")
+	}
+	if !errors.Is(captured, context.DeadlineExceeded) {
+		t.Errorf("error handler got %v, want one wrapping context.DeadlineExceeded", captured)
+	}
+	if callCount == 0 {
+		t.Error("expected at least one error handler invocation")
+	}
+}
+
+// TestSingletonView_WithErrorHandler_OnPersistFailure verifies that the
+// callback configured via WithSingletonViewErrorHandler is invoked when the
+// persistence Save fails. Documented in CHANGELOG: "WithSingletonViewErrorHandler
+// option for error callbacks on SingletonView persistence failures".
+func TestSingletonView_WithErrorHandler_OnPersistFailure(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		gotName  string
+		gotErr   error
+		gotCalls int
+	)
+
+	s := config.NewSingleton[appConfig]("app_config")
+	_ = s.Swap(v1(), appConfig{MaxItems: 7})
+
+	_ = config.NewSingletonView("sv-err", s,
+		func(c appConfig) int { return c.MaxItems },
+		config.WithSingletonViewPersistence[appConfig, int](&failingPersistence{}),
+		config.WithSingletonViewErrorHandler[appConfig, int](func(name string, err error) {
+			mu.Lock()
+			defer mu.Unlock()
+			gotCalls++
+			gotName = name
+			gotErr = err
+		}),
+	)
+
+	// Async persistence runs in a goroutine.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		ok := gotCalls > 0
+		mu.Unlock()
+		if ok {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotCalls == 0 {
+		t.Fatal("error handler was not invoked on persist failure")
+	}
+	if gotName != "sv-err" {
+		t.Errorf("error handler name = %q, want 'sv-err'", gotName)
+	}
+	if gotErr == nil {
+		t.Fatal("error handler got nil error")
+	}
+	if !strings.Contains(gotErr.Error(), "save failed") {
+		t.Errorf("error handler error = %v, want to wrap 'save failed'", gotErr)
 	}
 }
