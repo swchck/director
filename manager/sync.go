@@ -37,6 +37,12 @@ func (m *Manager) syncAll(ctx context.Context) {
 	for _, reg := range m.configs {
 		if err := m.leaderSync(ctx, reg, false); err != nil {
 			m.metrics.SyncFailed(reg.name(), err)
+			if errors.Is(err, ErrValidationFailed) {
+				// reg.fetchAndSwap / fetchAndStage already deduped + warn-logged
+				// via reportFailure; suppress the generic "leader sync failed"
+				// noise so polling on a chronically-bad version doesn't spam.
+				continue
+			}
 			m.logger.Error("manager: leader sync failed", dlog.Err(err), dlog.String("collection", reg.name()))
 		}
 	}
@@ -313,12 +319,18 @@ func (m *Manager) handleSyncEvent(ctx context.Context, event notify.Event) {
 
 	if err := reg.swapFromBytes(version, snap.Content); err != nil {
 		m.metrics.FollowerFailed(event.Collection, err)
-		m.logger.Error("manager: swap from snapshot",
-			dlog.Err(err),
-			dlog.String("collection", event.Collection),
-			dlog.String("version", event.Version),
-		)
-		m.logApplyStatus(ctx, event.Collection, event.Version, "error")
+		status := "error"
+		if errors.Is(err, ErrValidationFailed) {
+			status = "validation_failed"
+			// reg.swapFromBytes already deduped + logged via reportFailure.
+		} else {
+			m.logger.Error("manager: swap from snapshot",
+				dlog.Err(err),
+				dlog.String("collection", event.Collection),
+				dlog.String("version", event.Version),
+			)
+		}
+		m.logApplyStatus(ctx, event.Collection, event.Version, status)
 		return
 	}
 
@@ -481,6 +493,9 @@ func (m *Manager) syncOneForced(ctx context.Context, reg registrable) {
 
 	if err := m.leaderSync(ctx, reg, true); err != nil {
 		m.metrics.SyncFailed(reg.name(), err)
+		if errors.Is(err, ErrValidationFailed) {
+			return // already logged via reportFailure dedup
+		}
 		m.logger.Error("manager: ws-triggered sync failed", dlog.Err(err), dlog.String("collection", reg.name()))
 	}
 }
@@ -598,13 +613,25 @@ func (m *Manager) leaderSync2PC(ctx context.Context, reg registrable, force bool
 		}
 
 		m.metrics.PreparePhaseFailed(collection, roundID, reason)
-		m.logger.Warn("manager: 2PC aborting round",
-			dlog.Err(waitErr),
-			dlog.String("collection", collection),
-			dlog.String("version", version),
-			dlog.String("round_id", roundID),
-			dlog.String("reason", reason),
-		)
+		// Dedup on bare "round_aborted" (not the reason) so a flaky follower
+		// that times out one round and prepare_fails the next still produces
+		// a single warn per (collection, version).
+		if reg.shouldReport(newVersion, "round_aborted") {
+			m.logger.Warn("manager: 2PC aborting round",
+				dlog.Err(waitErr),
+				dlog.String("collection", collection),
+				dlog.String("version", version),
+				dlog.String("round_id", roundID),
+				dlog.String("reason", reason),
+			)
+		} else {
+			m.logger.Debug("manager: 2PC aborting round (dedup)",
+				dlog.String("collection", collection),
+				dlog.String("version", version),
+				dlog.String("round_id", roundID),
+				dlog.String("reason", reason),
+			)
+		}
 
 		abortEvent := notify.Event{
 			Action:     notify.ActionAbort,

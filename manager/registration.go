@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -12,6 +13,21 @@ import (
 	dlog "github.com/swchck/director/log"
 	"github.com/swchck/director/source"
 )
+
+// ErrValidationFailed is returned by registration entry points when a
+// user-supplied validator rejects a fetched or staged value. The error is
+// wrapped with %w so callers can match it via errors.Is.
+//
+// On validation failure, the in-memory config is NOT swapped — the cluster
+// stays on the previous known-good version. The leader's snapshot is not
+// persisted (eventually-consistent path) or the 2PC round is aborted
+// (RequireUnanimousApply path). The leader retries on the next poll/WS cycle;
+// once the source data is fixed, the new version is fetched and applied.
+//
+// Validation failures are logged at most once per (collection, version) tuple
+// to avoid flooding the logs while the cluster waits for the source to be
+// fixed; the dedup cache resets on the next successful apply.
+var ErrValidationFailed = errors.New("manager: validation failed")
 
 // stagedRef is an opaque handle to a staged-but-not-committed config value.
 // Produced by fetchAndStage / stageFromBytes, consumed by commitStaged.
@@ -66,6 +82,19 @@ type registrable interface {
 
 	// abortByRoundID discards the staged value by roundID; no-op if unknown.
 	abortByRoundID(roundID string)
+
+	// reportFailure records an external failure (e.g. 2PC round aborted on
+	// leader because a follower returned prepare_failed) using the same
+	// per-version dedup as the internal validator path. The log entry is
+	// emitted at most once per (collection, version) tuple.
+	reportFailure(ver config.Version, kind string, err error)
+
+	// shouldReport returns true when (ver, kind) hasn't been logged yet by
+	// reportFailure, allowing callers to dedup their own contextual log
+	// entries without re-emitting the generic warning. Calling shouldReport
+	// also marks the (ver, kind) tuple as reported, so subsequent calls with
+	// the same arguments return false until the next successful apply.
+	shouldReport(ver config.Version, kind string) bool
 }
 
 // stagedCollection holds a staged collection value awaiting commit.
@@ -88,13 +117,46 @@ type stagedSingleton[T any] struct {
 
 func (s *stagedSingleton[T]) roundID() string { return s.id }
 
+// failureState tracks the most recently reported failure version so the same
+// validation/abort error isn't logged repeatedly while the cluster waits for
+// the upstream data to be fixed. Cleared on successful apply.
+type failureState struct {
+	mu      sync.Mutex
+	lastVer config.Version
+	lastKey string // {kind}:{ver} — guards against same version with different failure kinds being silenced
+}
+
+func (f *failureState) shouldLog(ver config.Version, kind string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	key := kind + ":" + ver.String()
+	if f.lastKey == key {
+		return false
+	}
+	f.lastVer = ver
+	f.lastKey = key
+	return true
+}
+
+func (f *failureState) clear() {
+	f.mu.Lock()
+	f.lastVer = config.Version{}
+	f.lastKey = ""
+	f.mu.Unlock()
+}
+
 type collectionReg[T any] struct {
-	cfg    *config.Collection[T]
-	src    source.CollectionSource[T]
-	logger dlog.Logger
+	cfg       *config.Collection[T]
+	src       source.CollectionSource[T]
+	logger    dlog.Logger
+	metrics   Metrics
+	validator func([]T) error
 
 	stageMu sync.Mutex
 	staged  map[string]*stagedCollection[T]
+
+	failure failureState
 }
 
 func (r *collectionReg[T]) name() string {
@@ -109,10 +171,36 @@ func (r *collectionReg[T]) fetchVersion(ctx context.Context) (time.Time, error) 
 	return r.src.LastModified(ctx)
 }
 
+func (r *collectionReg[T]) reportFailure(ver config.Version, kind string, err error) {
+	if !r.failure.shouldLog(ver, kind) {
+		return
+	}
+	r.logger.Warn("manager: config update rejected",
+		dlog.String("collection", r.cfg.Name()),
+		dlog.String("version", ver.String()),
+		dlog.String("kind", kind),
+		dlog.Err(err),
+	)
+	if r.metrics != nil {
+		r.metrics.ValidationFailed(r.cfg.Name())
+	}
+}
+
+func (r *collectionReg[T]) shouldReport(ver config.Version, kind string) bool {
+	return r.failure.shouldLog(ver, kind)
+}
+
 func (r *collectionReg[T]) fetchAndSwap(ctx context.Context, ver config.Version) ([]byte, error) {
 	items, err := r.src.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("manager: fetch %s: %w", r.cfg.Name(), err)
+	}
+
+	if r.validator != nil {
+		if vErr := r.validator(items); vErr != nil {
+			r.reportFailure(ver, "validator", vErr)
+			return nil, fmt.Errorf("manager: %s: %w: %w", r.cfg.Name(), ErrValidationFailed, vErr)
+		}
 	}
 
 	oldCount := r.cfg.Count()
@@ -125,6 +213,8 @@ func (r *collectionReg[T]) fetchAndSwap(ctx context.Context, ver config.Version)
 	if err := r.cfg.Swap(ver, items); err != nil {
 		return data, fmt.Errorf("manager: swap %s: %w", r.cfg.Name(), err)
 	}
+
+	r.failure.clear()
 
 	r.logger.Debug("manager: collection swapped",
 		dlog.String("collection", r.cfg.Name()),
@@ -142,11 +232,20 @@ func (r *collectionReg[T]) swapFromBytes(ver config.Version, data []byte) error 
 		return fmt.Errorf("manager: unmarshal %s: %w", r.cfg.Name(), err)
 	}
 
+	if r.validator != nil {
+		if vErr := r.validator(items); vErr != nil {
+			r.reportFailure(ver, "validator", vErr)
+			return fmt.Errorf("manager: %s: %w: %w", r.cfg.Name(), ErrValidationFailed, vErr)
+		}
+	}
+
 	oldCount := r.cfg.Count()
 
 	if err := r.cfg.Swap(ver, items); err != nil {
 		return fmt.Errorf("manager: swap %s from bytes: %w", r.cfg.Name(), err)
 	}
+
+	r.failure.clear()
 
 	r.logger.Debug("manager: collection swapped from snapshot",
 		dlog.String("collection", r.cfg.Name()),
@@ -162,6 +261,13 @@ func (r *collectionReg[T]) fetchAndStage(ctx context.Context, ver config.Version
 	items, err := r.src.List(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("manager: fetch %s: %w", r.cfg.Name(), err)
+	}
+
+	if r.validator != nil {
+		if vErr := r.validator(items); vErr != nil {
+			r.reportFailure(ver, "validator", vErr)
+			return nil, nil, fmt.Errorf("manager: %s: %w: %w", r.cfg.Name(), ErrValidationFailed, vErr)
+		}
 	}
 
 	data, err := json.Marshal(items)
@@ -185,6 +291,13 @@ func (r *collectionReg[T]) stageFromBytes(ver config.Version, roundID string, da
 	var items []T
 	if err := json.Unmarshal(data, &items); err != nil {
 		return nil, fmt.Errorf("manager: unmarshal %s: %w", r.cfg.Name(), err)
+	}
+
+	if r.validator != nil {
+		if vErr := r.validator(items); vErr != nil {
+			r.reportFailure(ver, "validator", vErr)
+			return nil, fmt.Errorf("manager: %s: %w: %w", r.cfg.Name(), ErrValidationFailed, vErr)
+		}
 	}
 
 	return r.stash(ver, roundID, items, ttl), nil
@@ -245,6 +358,8 @@ func (r *collectionReg[T]) commitStaged(staged stagedRef) error {
 		return fmt.Errorf("manager: commit swap %s: %w", r.cfg.Name(), err)
 	}
 
+	r.failure.clear()
+
 	r.logger.Debug("manager: collection committed from stage",
 		dlog.String("collection", r.cfg.Name()),
 		dlog.String("round_id", s.id),
@@ -271,6 +386,8 @@ func (r *collectionReg[T]) commitByRoundID(roundID string) (bool, error) {
 	if err := r.cfg.Swap(s.ver, s.items); err != nil {
 		return true, fmt.Errorf("manager: commit swap %s: %w", r.cfg.Name(), err)
 	}
+
+	r.failure.clear()
 	return true, nil
 }
 
@@ -296,12 +413,16 @@ func (r *collectionReg[T]) abortByRoundID(roundID string) {
 }
 
 type singletonReg[T any] struct {
-	cfg    *config.Singleton[T]
-	src    source.SingletonSource[T]
-	logger dlog.Logger
+	cfg       *config.Singleton[T]
+	src       source.SingletonSource[T]
+	logger    dlog.Logger
+	metrics   Metrics
+	validator func(*T) error
 
 	stageMu sync.Mutex
 	staged  map[string]*stagedSingleton[T]
+
+	failure failureState
 }
 
 func (r *singletonReg[T]) name() string {
@@ -316,10 +437,36 @@ func (r *singletonReg[T]) fetchVersion(ctx context.Context) (time.Time, error) {
 	return r.src.LastModified(ctx)
 }
 
+func (r *singletonReg[T]) reportFailure(ver config.Version, kind string, err error) {
+	if !r.failure.shouldLog(ver, kind) {
+		return
+	}
+	r.logger.Warn("manager: config update rejected",
+		dlog.String("singleton", r.cfg.Name()),
+		dlog.String("version", ver.String()),
+		dlog.String("kind", kind),
+		dlog.Err(err),
+	)
+	if r.metrics != nil {
+		r.metrics.ValidationFailed(r.cfg.Name())
+	}
+}
+
+func (r *singletonReg[T]) shouldReport(ver config.Version, kind string) bool {
+	return r.failure.shouldLog(ver, kind)
+}
+
 func (r *singletonReg[T]) fetchAndSwap(ctx context.Context, ver config.Version) ([]byte, error) {
 	item, err := r.src.Get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("manager: fetch singleton %s: %w", r.cfg.Name(), err)
+	}
+
+	if r.validator != nil {
+		if vErr := r.validator(item); vErr != nil {
+			r.reportFailure(ver, "validator", vErr)
+			return nil, fmt.Errorf("manager: %s: %w: %w", r.cfg.Name(), ErrValidationFailed, vErr)
+		}
 	}
 
 	data, err := json.Marshal(item)
@@ -330,6 +477,8 @@ func (r *singletonReg[T]) fetchAndSwap(ctx context.Context, ver config.Version) 
 	if err := r.cfg.Swap(ver, *item); err != nil {
 		return data, fmt.Errorf("manager: swap singleton %s: %w", r.cfg.Name(), err)
 	}
+
+	r.failure.clear()
 
 	r.logger.Debug("manager: singleton swapped",
 		dlog.String("singleton", r.cfg.Name()),
@@ -345,9 +494,18 @@ func (r *singletonReg[T]) swapFromBytes(ver config.Version, data []byte) error {
 		return fmt.Errorf("manager: unmarshal singleton %s: %w", r.cfg.Name(), err)
 	}
 
+	if r.validator != nil {
+		if vErr := r.validator(&item); vErr != nil {
+			r.reportFailure(ver, "validator", vErr)
+			return fmt.Errorf("manager: %s: %w: %w", r.cfg.Name(), ErrValidationFailed, vErr)
+		}
+	}
+
 	if err := r.cfg.Swap(ver, item); err != nil {
 		return fmt.Errorf("manager: swap singleton %s from bytes: %w", r.cfg.Name(), err)
 	}
+
+	r.failure.clear()
 
 	r.logger.Debug("manager: singleton swapped from snapshot",
 		dlog.String("singleton", r.cfg.Name()),
@@ -361,6 +519,13 @@ func (r *singletonReg[T]) fetchAndStage(ctx context.Context, ver config.Version,
 	item, err := r.src.Get(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("manager: fetch singleton %s: %w", r.cfg.Name(), err)
+	}
+
+	if r.validator != nil {
+		if vErr := r.validator(item); vErr != nil {
+			r.reportFailure(ver, "validator", vErr)
+			return nil, nil, fmt.Errorf("manager: %s: %w: %w", r.cfg.Name(), ErrValidationFailed, vErr)
+		}
 	}
 
 	data, err := json.Marshal(item)
@@ -383,6 +548,13 @@ func (r *singletonReg[T]) stageFromBytes(ver config.Version, roundID string, dat
 	var item T
 	if err := json.Unmarshal(data, &item); err != nil {
 		return nil, fmt.Errorf("manager: unmarshal singleton %s: %w", r.cfg.Name(), err)
+	}
+
+	if r.validator != nil {
+		if vErr := r.validator(&item); vErr != nil {
+			r.reportFailure(ver, "validator", vErr)
+			return nil, fmt.Errorf("manager: %s: %w: %w", r.cfg.Name(), ErrValidationFailed, vErr)
+		}
 	}
 
 	return r.stash(ver, roundID, item, ttl), nil
@@ -441,6 +613,8 @@ func (r *singletonReg[T]) commitStaged(staged stagedRef) error {
 	if err := r.cfg.Swap(s.ver, s.value); err != nil {
 		return fmt.Errorf("manager: commit swap singleton %s: %w", r.cfg.Name(), err)
 	}
+
+	r.failure.clear()
 	return nil
 }
 
@@ -462,6 +636,8 @@ func (r *singletonReg[T]) commitByRoundID(roundID string) (bool, error) {
 	if err := r.cfg.Swap(s.ver, s.value); err != nil {
 		return true, fmt.Errorf("manager: commit swap singleton %s: %w", r.cfg.Name(), err)
 	}
+
+	r.failure.clear()
 	return true, nil
 }
 
@@ -486,39 +662,90 @@ func (r *singletonReg[T]) abortByRoundID(roundID string) {
 	delete(r.staged, roundID)
 }
 
+// CollectionOption configures a registered collection.
+// Returned by helpers like WithCollectionValidator.
+type CollectionOption[T any] func(*collectionReg[T])
+
+// SingletonOption configures a registered singleton.
+type SingletonOption[T any] func(*singletonReg[T])
+
+// WithCollectionValidator installs a pre-apply validator for a collection.
+//
+// The validator is invoked after the items are fetched (or received as a 2PC
+// snapshot) and before the in-memory config is swapped. If it returns an
+// error, the swap is skipped, the cluster stays on the previous version, and
+// the leader retries on the next poll/WS cycle. The same (collection, version)
+// failure is logged at most once.
+//
+// In RequireUnanimousApply mode a follower-side rejection causes the leader's
+// 2PC round to abort — every replica should typically install the same
+// validator to avoid one-sided rejections that block cluster-wide updates.
+func WithCollectionValidator[T any](v func([]T) error) CollectionOption[T] {
+	return func(r *collectionReg[T]) {
+		r.validator = v
+	}
+}
+
+// WithSingletonValidator installs a pre-apply validator for a singleton.
+// See WithCollectionValidator for full semantics.
+func WithSingletonValidator[T any](v func(*T) error) SingletonOption[T] {
+	return func(r *singletonReg[T]) {
+		r.validator = v
+	}
+}
+
 // RegisterCollectionSource registers a collection with a generic data source.
-// Use this when implementing a custom backend (not Directus).
+// Use this when implementing a custom backend (not Directus) or to attach
+// per-collection options like WithCollectionValidator.
 //
 // Example with a custom source:
 //
-//	manager.RegisterCollectionSource(mgr, products, &myCustomAPI{})
-func RegisterCollectionSource[T any](m *Manager, cfg *config.Collection[T], src source.CollectionSource[T]) {
-	m.register(&collectionReg[T]{
-		cfg:    cfg,
-		src:    src,
-		logger: m.logger,
-	})
+//	manager.RegisterCollectionSource(mgr, products, &myCustomAPI{},
+//	    manager.WithCollectionValidator(func(items []Product) error {
+//	        if len(items) == 0 { return errors.New("empty product list") }
+//	        return nil
+//	    }))
+func RegisterCollectionSource[T any](m *Manager, cfg *config.Collection[T], src source.CollectionSource[T], opts ...CollectionOption[T]) {
+	r := &collectionReg[T]{
+		cfg:     cfg,
+		src:     src,
+		logger:  m.logger,
+		metrics: m.metrics,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	m.register(r)
 }
 
 // RegisterSingletonSource registers a singleton with a generic data source.
-func RegisterSingletonSource[T any](m *Manager, cfg *config.Singleton[T], src source.SingletonSource[T]) {
-	m.register(&singletonReg[T]{
-		cfg:    cfg,
-		src:    src,
-		logger: m.logger,
-	})
+// See RegisterCollectionSource for the options pattern.
+func RegisterSingletonSource[T any](m *Manager, cfg *config.Singleton[T], src source.SingletonSource[T], opts ...SingletonOption[T]) {
+	r := &singletonReg[T]{
+		cfg:     cfg,
+		src:     src,
+		logger:  m.logger,
+		metrics: m.metrics,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	m.register(r)
 }
 
 // RegisterCollection registers a collection sourced from Directus.
 // This is a convenience wrapper that creates a source.CollectionSource from directus.Items[T].
 //
 // opts are Directus query options applied to every fetch (e.g. WithFields, WithDeep).
+// To attach a validator or other manager-level options, use
+// RegisterCollectionSource with source.FromDirectus instead.
 func RegisterCollection[T any](m *Manager, cfg *config.Collection[T], items *directus.Items[T], opts ...directus.QueryOption) {
 	RegisterCollectionSource(m, cfg, source.FromDirectus(items, opts...))
 }
 
 // RegisterSingleton registers a singleton sourced from Directus.
 // This is a convenience wrapper that creates a source.SingletonSource from directus.Singleton[T].
+// To attach a validator, use RegisterSingletonSource with source.FromDirectusSingleton.
 func RegisterSingleton[T any](m *Manager, cfg *config.Singleton[T], singleton *directus.Singleton[T], opts ...directus.QueryOption) {
 	RegisterSingletonSource(m, cfg, source.FromDirectusSingleton(singleton, opts...))
 }

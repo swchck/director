@@ -93,6 +93,48 @@ Trade-off: a chronically broken replica blocks config updates for the entire clu
 
 See [sync-protocol.md](./sync-protocol.md#two-phase-commit-mode-strict-consistency) for the full protocol and operational notes.
 
+## Pre-Apply Validation
+
+Attach a validator at registration time to reject upstream data before it is swapped into memory:
+
+```go
+manager.RegisterCollectionSource(mgr, products, productSource,
+    manager.WithCollectionValidator(func(items []Product) error {
+        if len(items) == 0 {
+            return errors.New("empty product list")
+        }
+        for _, p := range items {
+            if p.Price < 0 {
+                return fmt.Errorf("invalid price for %s: %d", p.SKU, p.Price)
+            }
+        }
+        return nil
+    }),
+)
+
+manager.RegisterSingletonSource(mgr, settings, settingsSource,
+    manager.WithSingletonValidator(func(s *Settings) error {
+        if s.Theme == "" { return errors.New("missing theme") }
+        return nil
+    }),
+)
+```
+
+Behavior:
+
+- Validator runs after fetch/deserialize and **before** `Swap()`. Non-nil error → no swap, version not advanced, snapshot not activated.
+- Errors are wrapped with `manager.ErrValidationFailed` for `errors.Is` matching.
+- The cluster stays on the **previous** known-good version. If no good version was ever applied (validator failed on first sync, or the persisted snapshot fails the current validator on startup), the collection stays empty until a valid version arrives.
+- WebSocket events do **not** carry payload — they trigger a re-fetch. After a rejection, the next WS event or poll cycle re-fetches the **current** source state. Once the source data is fixed, the new version is applied automatically.
+- Each `(collection, version)` failure is logged at most once. The dedup state resets on the next successful apply, so subsequent invalid versions are still surfaced.
+- `Metrics.ValidationFailed(collection)` fires on each rejection.
+
+In `RequireUnanimousApply` (2PC) mode:
+
+- A leader-side rejection skips the round entirely (no snapshot, no `prepare` event published).
+- A follower-side rejection logs `prepare_failed` in the apply log → leader aborts the round → no replica applies. The leader's "round aborted" warning is also deduped per `(collection, version)` so retries do not flood the log.
+- Every replica should typically install the **same** validator — a one-sided rejection blocks cluster-wide updates until the source is fixed.
+
 ## Starting
 
 ```go
@@ -241,3 +283,11 @@ On shutdown, the manager deregisters from the instance registry.
 | `WithCache(cache, strategy)` | Enable caching with a specific strategy |
 | `WithInstanceID(id)` | Override auto-generated UUID instance ID |
 | `WithWebSocket(ws)` | Enable real-time change detection |
+| `WithMetrics(m)` | Receive observability events |
+
+### Per-Registration Options
+
+| Option | Description |
+|---|---|
+| `WithCollectionValidator(fn)` | Pre-apply validator for `RegisterCollectionSource` (see [Pre-Apply Validation](#pre-apply-validation)) |
+| `WithSingletonValidator(fn)` | Pre-apply validator for `RegisterSingletonSource` |

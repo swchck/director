@@ -71,6 +71,11 @@ type Metrics interface {
 	// StagedDropped is called when a staged 2PC snapshot is discarded
 	// before commit — via abort, TTL expiry, or explicit drop.
 	StagedDropped(collection, reason string)
+
+	// ValidationFailed is called when a user-supplied validator rejects a
+	// fetched or staged value. Emitted at most once per (collection, version);
+	// repeated rejections of the same version are suppressed.
+	ValidationFailed(collection string)
 }
 
 // nopMetrics is the default no-op implementation.
@@ -90,6 +95,7 @@ func (nopMetrics) PreparePhaseFailed(string, string, string) {}
 func (nopMetrics) FollowerPrepared(string)                  {}
 func (nopMetrics) FollowerPrepareFailed(string, error)      {}
 func (nopMetrics) StagedDropped(string, string)             {}
+func (nopMetrics) ValidationFailed(string)                  {}
 
 // NopMetrics returns a Metrics implementation that discards all telemetry.
 func NopMetrics() Metrics {
