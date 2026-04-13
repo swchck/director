@@ -3,6 +3,7 @@ package manager_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -405,7 +406,7 @@ func TestManager_WebSocketDebouncing_BulkEventsCollapseToOneSync(t *testing.T) {
 
 	wsSrv := newWSBehaviorServer(t, func(uid string, write func(map[string]any)) {
 		// Fire 5 events in rapid succession, all for the same uid.
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			write(map[string]any{
 				"type":  "subscription",
 				"uid":   uid,
@@ -539,7 +540,8 @@ func TestManager_WebSocketFallback_OnChannelClose(t *testing.T) {
 	select {
 	case err := <-errCh:
 		// If Start returned, it must be due to context cancellation, not a WS-related error.
-		if _, isPanic := err.(*recoverErr); isPanic {
+		var pe *recoverErr
+		if errors.As(err, &pe) {
 			t.Fatalf("manager panicked on WS close: %v", err)
 		}
 		t.Fatalf("manager exited prematurely on WS close: %v (ctx err: %v)", err, ctx.Err())
@@ -558,7 +560,8 @@ func TestManager_WebSocketFallback_OnChannelClose(t *testing.T) {
 	cancel()
 	select {
 	case err := <-errCh:
-		if _, isPanic := err.(*recoverErr); isPanic {
+		var pe *recoverErr
+		if errors.As(err, &pe) {
 			t.Fatalf("manager panicked during shutdown: %v", err)
 		}
 		// context-cancelled error is acceptable
