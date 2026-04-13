@@ -22,4 +22,10 @@ type Registry interface {
 	// AliveCount returns the number of instances with a recent heartbeat
 	// for the given service name.
 	AliveCount(ctx context.Context, serviceName string) (int, error)
+
+	// AliveInstances returns the instance IDs with a recent heartbeat for
+	// the given service name. Used by the 2PC sync protocol to build a
+	// stable target set for a sync round (unlike AliveCount, which only
+	// returns a number).
+	AliveInstances(ctx context.Context, serviceName string) ([]string, error)
 }

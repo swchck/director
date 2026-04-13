@@ -60,6 +60,20 @@ func (r *memoryRegistry) AliveCount(_ context.Context, serviceName string) (int,
 	return count, nil
 }
 
+func (r *memoryRegistry) AliveInstances(_ context.Context, serviceName string) ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var ids []string
+	for id, svc := range r.instances {
+		if svc == serviceName {
+			ids = append(ids, id)
+		}
+	}
+
+	return ids, nil
+}
+
 func TestMemoryRegistry_RegisterAndAliveCount(t *testing.T) {
 	reg := newMemoryRegistry()
 	ctx := context.Background()

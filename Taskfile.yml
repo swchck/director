@@ -44,6 +44,19 @@ tasks:
         echo "Timed out waiting for Directus"
         exit 1
 
+  ensure-up:
+    desc: Ensure services are running (no-op if Directus is already healthy)
+    cmds:
+      - |
+        if curl -sf http://localhost:8055/server/health > /dev/null 2>&1; then
+          echo "Services already running."
+          exit 0
+        fi
+        echo "Services not running — starting via docker compose up -d..."
+        docker compose up -d
+      - task: wait-healthy
+    silent: true
+
   logs:
     desc: Show service logs
     cmds:
@@ -55,7 +68,8 @@ tasks:
       - go test -race -count=1 ./...
 
   test:e2e:
-    desc: Run e2e tests against real Directus (services must be running)
+    desc: Run e2e tests against real Directus (auto-starts services if needed; leaves them running)
+    deps: [ensure-up]
     env:
       DIRECTUS_URL: "{{.DIRECTUS_URL}}"
       DIRECTUS_TOKEN: "{{.DIRECTUS_TOKEN}}"

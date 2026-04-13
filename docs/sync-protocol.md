@@ -231,3 +231,136 @@ If the WebSocket connection drops:
 2. Manager sets `wsEvents = nil` (disables the select case)
 3. Poll ticker resets to normal `PollInterval`
 4. No panics, no goroutine leaks — seamless fallback
+
+## Two-Phase Commit Mode (strict consistency)
+
+The default sync protocol is **eventually-consistent**: a slow or broken follower cannot block the leader from advancing, so different replicas may briefly (or, if data stops changing, indefinitely) run on different versions.
+
+For workloads that require the cluster-wide invariant *"at any moment every alive replica runs the same config version"*, opt in to **two-phase commit** via `Options.RequireUnanimousApply = true`.
+
+### Guarantee
+
+- Either **all** alive replicas transition `vN → vN+1`, or **nobody** does.
+- A broken replica cannot permanently diverge.
+- There is a brief skew window (fractions of a second up to a few seconds) between when the leader publishes `commit` and each follower actually performs its local `Swap()`. This is inherent to distributed systems — *true* simultaneity requires synchronized clocks + scheduled activation time.
+
+### Trade-off
+
+- **A single chronically-broken replica blocks ALL config updates cluster-wide.** The leader retries on each poll / WS cycle but will keep aborting until every replica can prepare.
+- Dead replicas that have not deregistered (kill −9, OOM, network partition) block progress for up to `registry.staleThreshold` (default 30 s) after their last heartbeat, because they still appear in `AliveInstances` during that window.
+- **Mixed-mode clusters are unsupported.** Every replica of the same service must agree on `RequireUnanimousApply`. A mix of 2PC and eventually-consistent managers will violate the invariant.
+
+### Protocol
+
+On each leader round (poll or WS-triggered), for each collection:
+
+```
+1.  VERSION CHECK            same as eventually-consistent mode
+2.  STAGE (no swap yet)
+    - Leader fetches all items, serializes, stores in-memory staged slot
+      keyed by a fresh roundID; in-memory config is NOT updated yet.
+3.  PERSIST SNAPSHOT
+    INSERT INTO config_snapshots (..., status='pending')
+3a. RESET APPLY LOG
+    DELETE FROM config_apply_log WHERE collection=... AND version=...
+    - Wipes any stale 'prepared'/'committed' rows from a prior aborted
+      round of the same version. Safe under the advisory lock.
+4.  TARGET SET
+    - Leader records AliveInstances(service) as the target set.
+    - Leader self-logs "prepared" in config_apply_log.
+5.  PUBLISH PREPARE
+    pg_notify('{"action":"prepare","collection":...,"version":...,"round_id":...}')
+6.  WAIT FOR PREPARES (loop every 500ms until WaitConfirmationsTimeout)
+    - alive    = AliveInstances(service) re-snapshotted every tick
+    - failed   = AppliedInstances(collection, version, 'prepare_failed')
+    - prepared = AppliedInstances(collection, version, 'prepared')
+    - If any (target ∩ alive) replica is in failed → abort immediately
+    - If every (target ∩ alive) replica is in prepared → proceed
+    - On timeout → abort
+7a. ON ABORT
+    - Publish {"action":"abort","round_id":...}
+    - Followers discard staged snapshot
+    - Leader marks snapshot as 'failed'
+    - Leader returns error; next poll/WS cycle will retry
+7b. ON COMMIT
+    - Publish {"action":"commit","round_id":...}
+    - Leader swaps staged value live, logs 'committed'
+    - Cache write happens AFTER commit (an aborted round never warms cache)
+    - ActivateSnapshot → this version becomes authoritative for new replicas
+```
+
+### Follower handlers
+
+- `prepare` → load snapshot from storage, deserialize into a staged slot keyed by `roundID`, log `prepared` or `prepare_failed`. Staged slots have a TTL (default `2 × WaitConfirmationsTimeout`) after which they're dropped.
+- `commit` → swap the staged value live under the matching `roundID`. If the staged slot is missing (TTL expired, manager restart), fall back to reloading from storage — the follower already committed to the invariant when it logged `prepared`.
+- `abort` → drop the staged slot. No apply-log entry is written (an aborted round leaves no trace except the `failed` snapshot).
+
+### Why target-by-instance-id (not AliveCount)
+
+The legacy protocol uses `AliveCount`. For 2PC that's insufficient: a replica that gets SIGKILLed continues to appear in the registry for up to `staleThreshold`. With count-based comparisons the leader would wait for a phantom, time out, and abort every round during that window.
+
+The 2PC protocol snapshots `AliveInstances → []instanceID` at round start and checks *per instance* on every tick. If an instance disappears from `AliveInstances` during the wait (heartbeat went stale), it drops out of the effective target. The round completes as long as all *currently* alive members of the target set have prepared.
+
+### Startup
+
+`loadFromCache` / `loadFromStorage` are unchanged — they load the last `active` snapshot, which under 2PC is always a fully committed version. A replica that joins mid-round sees only the pre-round active version until it subscribes and participates in the next round.
+
+### Configuration
+
+```go
+manager.Options{
+    ServiceName:              "my-service",
+    RequireUnanimousApply:    true,                     // opt in
+    WaitConfirmationsTimeout: 10 * time.Second,         // prepare timeout (default: 30s)
+    PrepareTTL:               30 * time.Second,         // follower staged TTL (default: 2 × WaitConfirmationsTimeout)
+}
+```
+
+### Sequence diagram (2PC, happy path)
+
+```
+        Leader                 Postgres              Follower A            Follower B
+          │                       │                      │                      │
+          │ fetch + stage(roundID)                       │                      │
+          │                       │                      │                      │
+          │ SaveSnapshot pending  │                      │                      │
+          │──────────────────────►│                      │                      │
+          │                       │                      │                      │
+          │ AliveInstances        │                      │                      │
+          │──────────────────────►│                      │                      │
+          │ ◄── [leader, A, B]    │                      │                      │
+          │                       │                      │                      │
+          │ LogApply(self, prepared)                     │                      │
+          │──────────────────────►│                      │                      │
+          │                       │                      │                      │
+          │ notify(prepare, roundID)                     │                      │
+          │──────────────────────►│ ───────────────────► │ ────────────────────►│
+          │                       │                      │                      │
+          │                       │  GetSnapshot         │                      │
+          │                       │◄─── stageFromBytes ──│                      │
+          │                       │  LogApply(A, prepared)                      │
+          │                       │◄─────────────────────│                      │
+          │                       │                 GetSnapshot                 │
+          │                       │◄────────────────────────────────────────────│
+          │                       │                     stageFromBytes          │
+          │                       │            LogApply(B, prepared)            │
+          │                       │◄────────────────────────────────────────────│
+          │                       │                      │                      │
+          │ AppliedInstances(prepared) every 500ms       │                      │
+          │──────────────────────►│                      │                      │
+          │ ◄── [leader, A, B]    │                      │                      │
+          │                       │                      │                      │
+          │ notify(commit, roundID)                      │                      │
+          │──────────────────────►│ ───────────────────► │ ────────────────────►│
+          │ commitStaged (Swap)   │                      │ commitStaged (Swap)  │ commitStaged (Swap)
+          │                       │                      │                      │
+          │ ActivateSnapshot      │                      │                      │
+          │──────────────────────►│                      │                      │
+```
+
+### Observability
+
+Implement the 2PC-specific `Metrics` methods to track round health:
+- `PreparePhaseStarted(collection, roundID)` / `PreparePhaseSucceeded` / `PreparePhaseFailed(reason)` — reason is `"prepare_failed"` or `"timeout"`.
+- `FollowerPrepared(collection)` / `FollowerPrepareFailed(collection, err)` — per-follower prepare outcomes.
+- `StagedDropped(collection, reason)` — reason is `"abort"` or `"ttl"`.

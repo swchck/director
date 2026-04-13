@@ -90,6 +90,13 @@ No circular dependencies. Each package can be used independently.
 
 Replicas can serve requests after step 2 or 3, before the source is contacted.
 
+## Consistency Modes
+
+Two protocols are available, selected per manager via `Options.RequireUnanimousApply`:
+
+- **Eventually consistent (default).** Leader applies new version locally, notifies followers, moves on. Broken followers don't block the leader. Replicas may briefly run on different versions. Best throughput and availability.
+- **Strict (2PC).** `RequireUnanimousApply = true`. Leader stages the new version, publishes `prepare`, waits until every alive replica confirms; only then publishes `commit`. A single failed `prepare` aborts the round for everyone. Guarantees all alive replicas run the same version (with a brief skew window during commit propagation) at the cost of liveness when any replica is broken. See [sync-protocol.md](./sync-protocol.md#two-phase-commit-mode-strict-consistency).
+
 ## View Update Chain
 
 ```
