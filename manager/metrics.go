@@ -46,6 +46,31 @@ type Metrics interface {
 
 	// WSEventReceived is called when a WebSocket change event is received.
 	WSEventReceived(collection string)
+
+	// PreparePhaseStarted is called when the leader begins a 2PC prepare round.
+	// Only emitted when Options.RequireUnanimousApply is enabled.
+	PreparePhaseStarted(collection, roundID string)
+
+	// PreparePhaseSucceeded is called when all target replicas successfully
+	// staged a new version in a 2PC round.
+	PreparePhaseSucceeded(collection, roundID string)
+
+	// PreparePhaseFailed is called when a 2PC round aborts — either because
+	// a follower returned prepare_failed or because the prepare timeout
+	// elapsed. reason is "prepare_failed" or "timeout".
+	PreparePhaseFailed(collection, roundID, reason string)
+
+	// FollowerPrepared is called when a follower successfully stages a
+	// 2PC snapshot.
+	FollowerPrepared(collection string)
+
+	// FollowerPrepareFailed is called when a follower fails to stage a
+	// 2PC snapshot.
+	FollowerPrepareFailed(collection string, err error)
+
+	// StagedDropped is called when a staged 2PC snapshot is discarded
+	// before commit — via abort, TTL expiry, or explicit drop.
+	StagedDropped(collection, reason string)
 }
 
 // nopMetrics is the default no-op implementation.
@@ -59,6 +84,12 @@ func (nopMetrics) CacheHit(string)                          {}
 func (nopMetrics) CacheMiss(string)                         {}
 func (nopMetrics) StorageLoaded(string)                     {}
 func (nopMetrics) WSEventReceived(string)                   {}
+func (nopMetrics) PreparePhaseStarted(string, string)       {}
+func (nopMetrics) PreparePhaseSucceeded(string, string)     {}
+func (nopMetrics) PreparePhaseFailed(string, string, string) {}
+func (nopMetrics) FollowerPrepared(string)                  {}
+func (nopMetrics) FollowerPrepareFailed(string, error)      {}
+func (nopMetrics) StagedDropped(string, string)             {}
 
 // NopMetrics returns a Metrics implementation that discards all telemetry.
 func NopMetrics() Metrics {

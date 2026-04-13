@@ -8,6 +8,7 @@ Source-agnostic Go library for syncing CMS/API data into your application's memo
 - **Generic typed configs** — `Collection[T]` and `Singleton[T]` with lock-free reads via `atomic.Pointer`
 - **Auto-sync** — poll-based and real-time WebSocket change detection with debouncing
 - **Multi-replica coordination** — leader election via Postgres advisory locks, follower sync via notifications
+- **Optional strict consistency** — opt-in two-phase commit (`RequireUnanimousApply`) guarantees every alive replica runs the same config version
 - **Materialized views** — precomputed filtered/sorted/grouped views that auto-update
 - **Relational support** — M2O, O2M, M2M, translations via deep queries and `RelatedView`
 - **Flexible caching** — in-memory, Redis snapshot cache, Redis view persistence

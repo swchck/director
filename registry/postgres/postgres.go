@@ -107,3 +107,49 @@ func (r *Registry) AliveCount(ctx context.Context, serviceName string) (int, err
 
 	return count, nil
 }
+
+// DeleteStaleInstances removes instance rows whose last_heartbeat is older
+// than olderThan, regardless of service. Returns the number of rows deleted.
+func (r *Registry) DeleteStaleInstances(ctx context.Context, olderThan time.Time) (int, error) {
+	const query = `DELETE FROM director.config_instances WHERE last_heartbeat < $1`
+
+	tag, err := r.pool.Exec(ctx, query, olderThan)
+	if err != nil {
+		return 0, fmt.Errorf("registry/postgres: delete stale instances: %w", err)
+	}
+
+	return int(tag.RowsAffected()), nil
+}
+
+// AliveInstances returns the instance IDs with a heartbeat newer than the
+// stale threshold for the given service name.
+func (r *Registry) AliveInstances(ctx context.Context, serviceName string) ([]string, error) {
+	const query = `
+		SELECT instance_id
+		FROM director.config_instances
+		WHERE service_name = $1 AND last_heartbeat > NOW() - $2::interval
+		ORDER BY instance_id`
+
+	interval := fmt.Sprintf("%.0f seconds", r.staleThreshold.Seconds())
+
+	rows, err := r.pool.Query(ctx, query, serviceName, interval)
+	if err != nil {
+		return nil, fmt.Errorf("registry/postgres: alive instances %s: %w", serviceName, err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("registry/postgres: alive instances scan %s: %w", serviceName, err)
+		}
+		ids = append(ids, id)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry/postgres: alive instances iter %s: %w", serviceName, err)
+	}
+
+	return ids, nil
+}

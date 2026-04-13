@@ -246,6 +246,16 @@ func (m *Manager) run(ctx context.Context, events <-chan notify.Event, wsEvents 
 	heartbeatTicker := time.NewTicker(m.opts.HeartbeatInterval)
 	defer heartbeatTicker.Stop()
 
+	// Maintenance ticker for periodic GC of old snapshots and stale instances.
+	// The channel is left nil when both retentions are disabled so the select
+	// case never fires — no wakeups, no work.
+	var maintenanceCh <-chan time.Time
+	if m.opts.SnapshotRetention > 0 || m.opts.InstanceRetention > 0 {
+		t := time.NewTicker(m.opts.MaintenanceInterval)
+		defer t.Stop()
+		maintenanceCh = t.C
+	}
+
 	// Debounce: collect changed collections over a short window, then sync once.
 	// This prevents mass rebuilds when many items are created/updated in quick succession.
 	pendingCollections := make(map[string]bool)
@@ -268,6 +278,9 @@ func (m *Manager) run(ctx context.Context, events <-chan notify.Event, wsEvents 
 			if err := m.registry.Heartbeat(ctx, m.instanceID); err != nil {
 				m.logger.Error("manager: heartbeat failed", dlog.Err(err))
 			}
+
+		case <-maintenanceCh:
+			m.runMaintenance(ctx)
 
 		case event, ok := <-events:
 			if !ok {

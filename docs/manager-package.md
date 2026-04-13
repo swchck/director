@@ -17,6 +17,8 @@ mgr := manager.New(
         ServiceName:              "my-service",       // groups replicas in registry
         WSPollInterval:           15 * time.Minute,   // poll interval when WS is active
         WSDebounce:               2 * time.Second,    // debounce window for WS events
+        RequireUnanimousApply:    false,              // opt in for strict 2PC (see below)
+        PrepareTTL:               0,                  // follower staged TTL (default: 2 × WaitConfirmationsTimeout)
     },
     manager.WithLogger(logger),                       // optional
     manager.WithCache(redisCache, cache.ReadWriteThrough), // optional
@@ -73,6 +75,23 @@ manager.RegisterSingletonSource(mgr, settings, &mySettingsAPI{})
 ```
 
 The `...QueryOption` args on `RegisterCollection`/`RegisterSingleton` are applied to every Directus fetch -- use them for relational fields, translations, etc.
+
+## Strict Consistency (2PC)
+
+Set `Options.RequireUnanimousApply = true` to run the **two-phase commit** variant of the sync protocol. In this mode a new version is applied by **every** alive replica or by **none** — a single follower that cannot prepare aborts the round and the leader retries on the next poll/WS cycle.
+
+```go
+mgr := manager.New(store, notifier, reg, manager.Options{
+    ServiceName:              "my-service",
+    RequireUnanimousApply:    true,
+    WaitConfirmationsTimeout: 10 * time.Second, // prepare phase timeout
+    PrepareTTL:               30 * time.Second, // how long followers hold staged state (default: 2 × WaitConfirmationsTimeout)
+})
+```
+
+Trade-off: a chronically broken replica blocks config updates for the entire cluster until it recovers or is removed from the registry. All replicas of the same service must use the same value for `RequireUnanimousApply` — mixed-mode clusters are unsupported.
+
+See [sync-protocol.md](./sync-protocol.md#two-phase-commit-mode-strict-consistency) for the full protocol and operational notes.
 
 ## Starting
 

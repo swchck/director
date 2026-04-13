@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -180,6 +181,103 @@ func (s *Storage) CountApplied(ctx context.Context, collection, version string) 
 	}
 
 	return count, nil
+}
+
+// ResetApplyLog deletes all apply-log rows for (collection, version).
+func (s *Storage) ResetApplyLog(ctx context.Context, collection, version string) error {
+	const query = `DELETE FROM director.config_apply_log WHERE collection_name = $1 AND version = $2`
+	if _, err := s.pool.Exec(ctx, query, collection, version); err != nil {
+		return fmt.Errorf("storage/postgres: reset apply log %s/%s: %w", collection, version, err)
+	}
+	return nil
+}
+
+// AppliedInstances returns the instance IDs that logged the given status
+// for (collection, version).
+func (s *Storage) AppliedInstances(ctx context.Context, collection, version, status string) ([]string, error) {
+	const query = `
+		SELECT instance_id
+		FROM director.config_apply_log
+		WHERE collection_name = $1 AND version = $2 AND status = $3
+		ORDER BY instance_id`
+
+	rows, err := s.pool.Query(ctx, query, collection, version, status)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: applied instances %s/%s/%s: %w", collection, version, status, err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("storage/postgres: applied instances scan %s/%s: %w", collection, version, err)
+		}
+		ids = append(ids, id)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage/postgres: applied instances iter %s/%s: %w", collection, version, err)
+	}
+
+	return ids, nil
+}
+
+// DeleteOldSnapshots removes snapshots created before olderThan, except those
+// in the 'active' status (which are preserved regardless of age so the
+// cluster can always recover the current authoritative version).
+//
+// In the same transaction, apply-log rows for the deleted snapshot versions
+// are removed. Returns the number of snapshots deleted.
+func (s *Storage) DeleteOldSnapshots(ctx context.Context, olderThan time.Time) (int, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("storage/postgres: delete old snapshots begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is harmless
+
+	const deleteSnapshots = `
+		DELETE FROM director.config_snapshots
+		WHERE status != $1 AND created_at < $2
+		RETURNING collection_name, version`
+
+	rows, err := tx.Query(ctx, deleteSnapshots, storage.StatusActive, olderThan)
+	if err != nil {
+		return 0, fmt.Errorf("storage/postgres: delete old snapshots: %w", err)
+	}
+
+	type cv struct {
+		collection string
+		version    string
+	}
+	var deleted []cv
+	for rows.Next() {
+		var c cv
+		if err := rows.Scan(&c.collection, &c.version); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("storage/postgres: delete old snapshots scan: %w", err)
+		}
+		deleted = append(deleted, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("storage/postgres: delete old snapshots iter: %w", err)
+	}
+
+	const deleteApplyLog = `
+		DELETE FROM director.config_apply_log
+		WHERE collection_name = $1 AND version = $2`
+	for _, c := range deleted {
+		if _, err := tx.Exec(ctx, deleteApplyLog, c.collection, c.version); err != nil {
+			return 0, fmt.Errorf("storage/postgres: delete apply log %s/%s: %w", c.collection, c.version, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("storage/postgres: delete old snapshots commit: %w", err)
+	}
+
+	return len(deleted), nil
 }
 
 // AcquireLock attempts to acquire a Postgres session-level advisory lock.
