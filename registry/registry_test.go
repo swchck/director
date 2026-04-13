@@ -4,18 +4,21 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/swchck/director/registry"
 )
 
 type memoryRegistry struct {
-	mu        sync.Mutex
-	instances map[string]string // instanceID -> serviceName
+	mu         sync.Mutex
+	instances  map[string]string    // instanceID -> serviceName
+	heartbeats map[string]time.Time // instanceID -> last heartbeat
 }
 
 func newMemoryRegistry() *memoryRegistry {
 	return &memoryRegistry{
-		instances: make(map[string]string),
+		instances:  make(map[string]string),
+		heartbeats: make(map[string]time.Time),
 	}
 }
 
@@ -24,6 +27,7 @@ func (r *memoryRegistry) Register(_ context.Context, instanceID, serviceName str
 	defer r.mu.Unlock()
 
 	r.instances[instanceID] = serviceName
+	r.heartbeats[instanceID] = time.Now()
 	return nil
 }
 
@@ -35,6 +39,7 @@ func (r *memoryRegistry) Heartbeat(_ context.Context, instanceID string) error {
 		return registry.ErrInstanceNotFound
 	}
 
+	r.heartbeats[instanceID] = time.Now()
 	return nil
 }
 
@@ -43,7 +48,23 @@ func (r *memoryRegistry) Deregister(_ context.Context, instanceID string) error 
 	defer r.mu.Unlock()
 
 	delete(r.instances, instanceID)
+	delete(r.heartbeats, instanceID)
 	return nil
+}
+
+func (r *memoryRegistry) DeleteStaleInstances(_ context.Context, olderThan time.Time) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	deleted := 0
+	for id, hb := range r.heartbeats {
+		if hb.Before(olderThan) {
+			delete(r.instances, id)
+			delete(r.heartbeats, id)
+			deleted++
+		}
+	}
+	return deleted, nil
 }
 
 func (r *memoryRegistry) AliveCount(_ context.Context, serviceName string) (int, error) {

@@ -158,6 +158,26 @@ func (s *memoryStorage) ResetApplyLog(_ context.Context, collection, version str
 	return nil
 }
 
+func (s *memoryStorage) DeleteOldSnapshots(_ context.Context, olderThan time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	deleted := 0
+	for k, snap := range s.snapshots {
+		if snap.Status == storage.StatusActive {
+			continue
+		}
+		if snap.CreatedAt.Before(olderThan) {
+			delete(s.snapshots, k)
+			cvKey := snap.Collection + ":" + snap.Version
+			delete(s.applyByStat, cvKey)
+			delete(s.applyLog, cvKey)
+			deleted++
+		}
+	}
+	return deleted, nil
+}
+
 func (s *memoryStorage) AcquireLock(_ context.Context, _ int64) (func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -439,5 +459,61 @@ func TestMemoryStorage_ConcurrentLock(t *testing.T) {
 
 	if count == 0 {
 		t.Error("no goroutine acquired the lock")
+	}
+}
+
+func TestMemoryStorage_DeleteOldSnapshots(t *testing.T) {
+	store := newMemoryStorage()
+	ctx := context.Background()
+
+	now := time.Now()
+
+	// v1: old + active (must survive regardless of age).
+	if err := store.SaveSnapshot(ctx, "items", "v1", []byte(`v1`)); err != nil {
+		t.Fatalf("SaveSnapshot v1: %v", err)
+	}
+	if err := store.ActivateSnapshot(ctx, "items", "v1"); err != nil {
+		t.Fatalf("Activate v1: %v", err)
+	}
+	store.snapshots["items:v1"].CreatedAt = now.Add(-365 * 24 * time.Hour)
+
+	// v2: old + inactive (eligible for GC).
+	if err := store.SaveSnapshot(ctx, "items", "v2", []byte(`v2`)); err != nil {
+		t.Fatalf("SaveSnapshot v2: %v", err)
+	}
+	store.snapshots["items:v2"].CreatedAt = now.Add(-90 * 24 * time.Hour)
+	store.snapshots["items:v2"].Status = storage.StatusInactive
+	_ = store.LogApply(ctx, "inst-1", "items", "v2", "applied")
+
+	// v3: recent + inactive (must survive — younger than cutoff).
+	if err := store.SaveSnapshot(ctx, "items", "v3", []byte(`v3`)); err != nil {
+		t.Fatalf("SaveSnapshot v3: %v", err)
+	}
+	store.snapshots["items:v3"].CreatedAt = now.Add(-1 * time.Hour)
+	store.snapshots["items:v3"].Status = storage.StatusInactive
+
+	cutoff := now.Add(-30 * 24 * time.Hour)
+	deleted, err := store.DeleteOldSnapshots(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("DeleteOldSnapshots: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1 (only v2)", deleted)
+	}
+
+	if _, err := store.GetSnapshot(ctx, "items", "v1"); err != nil {
+		t.Errorf("v1 (active) was wrongly deleted: %v", err)
+	}
+	if _, err := store.GetSnapshot(ctx, "items", "v2"); !errors.Is(err, storage.ErrSnapshotNotFound) {
+		t.Errorf("v2 (old inactive) survived: err=%v", err)
+	}
+	if _, err := store.GetSnapshot(ctx, "items", "v3"); err != nil {
+		t.Errorf("v3 (recent inactive) was wrongly deleted: %v", err)
+	}
+
+	// Apply log for v2 must be purged.
+	ids, _ := store.AppliedInstances(ctx, "items", "v2", "applied")
+	if len(ids) != 0 {
+		t.Errorf("apply log for v2 not purged: %v", ids)
 	}
 }

@@ -68,6 +68,10 @@ func (r *twoPCRegistry) AliveCount(_ context.Context, _ string) (int, error) {
 	return len(r.instances), nil
 }
 
+func (r *twoPCRegistry) DeleteStaleInstances(_ context.Context, _ time.Time) (int, error) {
+	return 0, nil
+}
+
 func (r *twoPCRegistry) AliveInstances(_ context.Context, _ string) ([]string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

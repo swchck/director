@@ -364,3 +364,59 @@ Implement the 2PC-specific `Metrics` methods to track round health:
 - `PreparePhaseStarted(collection, roundID)` / `PreparePhaseSucceeded` / `PreparePhaseFailed(reason)` — reason is `"prepare_failed"` or `"timeout"`.
 - `FollowerPrepared(collection)` / `FollowerPrepareFailed(collection, err)` — per-follower prepare outcomes.
 - `StagedDropped(collection, reason)` — reason is `"abort"` or `"ttl"`.
+
+## Maintenance: garbage-collecting old data
+
+By default, snapshots and registry rows accumulate forever — `director` keeps
+the full history so any replica can recover an arbitrary version, and dead
+replicas that never called `Deregister` linger in `config_instances` until
+manually cleaned.
+
+For long-running clusters, opt into periodic garbage collection via
+`manager.Options`:
+
+```go
+manager.Options{
+    ServiceName:         "my-service",
+    SnapshotRetention:   90 * 24 * time.Hour, // keep snapshots ~3 months
+    InstanceRetention:   24 * time.Hour,      // prune dead replicas after 1 day
+    MaintenanceInterval: time.Hour,            // run GC hourly (default)
+}
+```
+
+### Behavior
+
+- A maintenance ticker fires every `MaintenanceInterval`. Only the leader
+  (the manager that holds the advisory lock at that instant) actually performs
+  the deletes — followers see `ErrLockNotAcquired` and exit immediately, so
+  there is no stampede.
+- **Snapshots:** every snapshot whose `created_at < now() - SnapshotRetention`
+  AND `status != 'active'` is removed. Apply-log rows for the deleted snapshot
+  versions are removed in the same transaction. The currently-active snapshot
+  is **always** preserved regardless of age, so the cluster can always recover
+  the authoritative version (e.g. after a restart that loses cache).
+- **Instances:** every row in `config_instances` whose `last_heartbeat <
+  now() - InstanceRetention` is removed. `AliveCount` / `AliveInstances`
+  already filter by their own (much shorter) staleness window for sync
+  correctness, so this only affects long-dead rows.
+- Setting either retention to `0` (the default) disables that GC; setting both
+  to `0` skips creating the maintenance ticker entirely.
+
+### Choosing values
+
+- `SnapshotRetention` should be at least a few times your typical operational
+  rollback window. With 5-minute polls and frequent updates you may produce
+  hundreds of snapshots per day; 90 days strikes a balance between the ability
+  to investigate old states and database bloat.
+- `InstanceRetention` must be **far** larger than `HeartbeatInterval` (default
+  10s) and the registry stale threshold (default 30s) — pick at least 1 hour
+  to be safe against transient delays. The active sync protocol uses its own
+  staleness window, so this value only controls how long dead rows stick
+  around for inspection / accounting.
+
+### Mocks
+
+Custom `storage.Storage` and `registry.Registry` implementations must
+implement `DeleteOldSnapshots(ctx, olderThan)` and `DeleteStaleInstances(ctx,
+olderThan)` respectively. A no-op implementation (return `0, nil`) is safe if
+you don't want GC for that backend.

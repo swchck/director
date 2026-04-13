@@ -108,6 +108,19 @@ func (r *Registry) AliveCount(ctx context.Context, serviceName string) (int, err
 	return count, nil
 }
 
+// DeleteStaleInstances removes instance rows whose last_heartbeat is older
+// than olderThan, regardless of service. Returns the number of rows deleted.
+func (r *Registry) DeleteStaleInstances(ctx context.Context, olderThan time.Time) (int, error) {
+	const query = `DELETE FROM director.config_instances WHERE last_heartbeat < $1`
+
+	tag, err := r.pool.Exec(ctx, query, olderThan)
+	if err != nil {
+		return 0, fmt.Errorf("registry/postgres: delete stale instances: %w", err)
+	}
+
+	return int(tag.RowsAffected()), nil
+}
+
 // AliveInstances returns the instance IDs with a heartbeat newer than the
 // stale threshold for the given service name.
 func (r *Registry) AliveInstances(ctx context.Context, serviceName string) ([]string, error) {

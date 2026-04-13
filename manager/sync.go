@@ -42,6 +42,59 @@ func (m *Manager) syncAll(ctx context.Context) {
 	}
 }
 
+// runMaintenance is invoked by the maintenance ticker. Only the leader
+// (advisory-lock holder) actually performs deletions to avoid stampedes.
+// Followers see ErrLockNotAcquired and do nothing.
+func (m *Manager) runMaintenance(ctx context.Context) {
+	if m.opts.SnapshotRetention <= 0 && m.opts.InstanceRetention <= 0 {
+		return
+	}
+
+	release, err := m.storage.AcquireLock(ctx, m.opts.AdvisoryLockKey)
+	if err != nil {
+		if errors.Is(err, storage.ErrLockNotAcquired) {
+			return // someone else is leader; they'll run maintenance.
+		}
+		m.logger.Error("manager: maintenance acquire lock", dlog.Err(err))
+		return
+	}
+	defer release()
+
+	now := time.Now()
+
+	if m.opts.SnapshotRetention > 0 {
+		cutoff := now.Add(-m.opts.SnapshotRetention)
+		deleted, err := m.storage.DeleteOldSnapshots(ctx, cutoff)
+		if err != nil {
+			m.logger.Error("manager: delete old snapshots",
+				dlog.Err(err),
+				dlog.String("cutoff", cutoff.Format(time.RFC3339)),
+			)
+		} else if deleted > 0 {
+			m.logger.Info("manager: deleted old snapshots",
+				dlog.Int("count", deleted),
+				dlog.String("cutoff", cutoff.Format(time.RFC3339)),
+			)
+		}
+	}
+
+	if m.opts.InstanceRetention > 0 {
+		cutoff := now.Add(-m.opts.InstanceRetention)
+		deleted, err := m.registry.DeleteStaleInstances(ctx, cutoff)
+		if err != nil {
+			m.logger.Error("manager: delete stale instances",
+				dlog.Err(err),
+				dlog.String("cutoff", cutoff.Format(time.RFC3339)),
+			)
+		} else if deleted > 0 {
+			m.logger.Info("manager: deleted stale instances",
+				dlog.Int("count", deleted),
+				dlog.String("cutoff", cutoff.Format(time.RFC3339)),
+			)
+		}
+	}
+}
+
 // leaderSync performs the full leader sync protocol for a single config.
 // When force is true (e.g. triggered by WebSocket), the version check is skipped
 // and zero timestamps fall back to time.Now().

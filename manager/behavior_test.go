@@ -580,3 +580,138 @@ var _ = (*behaviorSource).List
 
 // Sanity: storage interface still satisfied by mockStorage (used in this file).
 var _ storage.Storage = (*mockStorage)(nil)
+
+// -- Maintenance loop tests -----------------------------------------------
+
+// TestManager_Maintenance_DeletesOldSnapshotsAndStaleInstances verifies that
+// when SnapshotRetention and InstanceRetention are configured, the periodic
+// maintenance loop (running on the leader) calls the GC methods. We use a
+// short MaintenanceInterval so the test doesn't wait an hour.
+func TestManager_Maintenance_DeletesOldSnapshotsAndStaleInstances(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	store := newMockStorage()
+	notif := newMockNotifier()
+	reg := newMockRegistry()
+
+	src := &behaviorSource{items: []twoPCArticle{{ID: 1}}, lastModified: now}
+	collA := config.NewCollection[twoPCArticle]("alpha")
+
+	// Pre-seed an old INACTIVE snapshot — eligible for GC.
+	oldVer := config.NewVersion(now.Add(-90 * 24 * time.Hour)).String()
+	if err := store.SaveSnapshot(ctx, "alpha", oldVer, []byte(`[]`)); err != nil {
+		t.Fatalf("SaveSnapshot old: %v", err)
+	}
+	store.mu.Lock()
+	store.snapshots["alpha:"+oldVer].CreatedAt = now.Add(-90 * 24 * time.Hour)
+	store.mu.Unlock()
+
+	mgr := manager.New(store, notif, reg, manager.Options{
+		PollInterval:             time.Hour,
+		WaitConfirmationsTimeout: 200 * time.Millisecond,
+		ServiceName:              "test-svc",
+		SnapshotRetention:        30 * 24 * time.Hour,
+		InstanceRetention:        24 * time.Hour,
+		MaintenanceInterval:      150 * time.Millisecond,
+	}, manager.WithInstanceID("inst-1"))
+	manager.RegisterCollectionSource(mgr, collA, src)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.Start(ctx) }()
+
+	// Wait for at least one maintenance tick to fire.
+	waitFor(t, 3*time.Second, func() bool {
+		reg.mu.Lock()
+		calls := reg.deleteStaleCalls
+		reg.mu.Unlock()
+		return calls > 0
+	})
+
+	reg.mu.Lock()
+	calls := reg.deleteStaleCalls
+	reg.mu.Unlock()
+	if calls == 0 {
+		t.Fatal("DeleteStaleInstances was never called")
+	}
+
+	// Old non-active snapshot must have been deleted.
+	if _, err := store.GetSnapshot(ctx, "alpha", oldVer); err == nil {
+		t.Errorf("old inactive snapshot %q was NOT deleted", oldVer)
+	}
+
+	// The CURRENT active snapshot (from initial sync) must always survive,
+	// even if its CreatedAt is artificially old.
+	curActive, err := store.GetActiveSnapshot(ctx, "alpha")
+	if err != nil {
+		t.Fatalf("expected an active snapshot to remain, got: %v", err)
+	}
+	store.mu.Lock()
+	store.snapshots["alpha:"+curActive.Version].CreatedAt = now.Add(-200 * 24 * time.Hour)
+	store.mu.Unlock()
+
+	// Trigger another maintenance cycle by waiting more.
+	time.Sleep(300 * time.Millisecond)
+
+	if _, err := store.GetActiveSnapshot(ctx, "alpha"); err != nil {
+		t.Errorf("active snapshot was wrongly deleted by GC: %v", err)
+	}
+
+	cancel()
+	<-errCh
+}
+
+// TestManager_Maintenance_DisabledByDefault verifies that when both retentions
+// are zero (default), the maintenance loop never fires — DeleteStaleInstances
+// is never called and old snapshots are preserved.
+func TestManager_Maintenance_DisabledByDefault(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	store := newMockStorage()
+	notif := newMockNotifier()
+	reg := newMockRegistry()
+
+	src := &behaviorSource{items: []twoPCArticle{{ID: 1}}, lastModified: now}
+	collA := config.NewCollection[twoPCArticle]("alpha")
+
+	oldVer := config.NewVersion(now.Add(-365 * 24 * time.Hour)).String()
+	if err := store.SaveSnapshot(ctx, "alpha", oldVer, []byte(`[]`)); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	store.mu.Lock()
+	store.snapshots["alpha:"+oldVer].CreatedAt = now.Add(-365 * 24 * time.Hour)
+	store.mu.Unlock()
+
+	mgr := manager.New(store, notif, reg, manager.Options{
+		PollInterval:             time.Hour,
+		WaitConfirmationsTimeout: 200 * time.Millisecond,
+		ServiceName:              "test-svc",
+		// SnapshotRetention/InstanceRetention left at zero — maintenance disabled.
+		MaintenanceInterval: 100 * time.Millisecond, // would fire often if enabled
+	})
+	manager.RegisterCollectionSource(mgr, collA, src)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.Start(ctx) }()
+
+	// Wait long enough that several maintenance ticks would have fired if enabled.
+	time.Sleep(800 * time.Millisecond)
+
+	reg.mu.Lock()
+	calls := reg.deleteStaleCalls
+	reg.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("DeleteStaleInstances called %d times despite maintenance disabled", calls)
+	}
+
+	// Old snapshot must still be present.
+	if _, err := store.GetSnapshot(ctx, "alpha", oldVer); err != nil {
+		t.Errorf("snapshot deleted despite maintenance disabled: %v", err)
+	}
+
+	cancel()
+	<-errCh
+}

@@ -166,6 +166,26 @@ func (s *mockStorage) ResetApplyLog(_ context.Context, collection, version strin
 	return nil
 }
 
+func (s *mockStorage) DeleteOldSnapshots(_ context.Context, olderThan time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	deleted := 0
+	for k, snap := range s.snapshots {
+		if snap.Status == storage.StatusActive {
+			continue
+		}
+		if snap.CreatedAt.Before(olderThan) {
+			delete(s.snapshots, k)
+			cvKey := snap.Collection + ":" + snap.Version
+			delete(s.applyByStat, cvKey)
+			delete(s.applyLog, cvKey)
+			deleted++
+		}
+	}
+	return deleted, nil
+}
+
 func (s *mockStorage) AcquireLock(_ context.Context, _ int64) (func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -229,9 +249,10 @@ func (n *mockNotifier) publishedEvents() []notify.Event {
 }
 
 type mockRegistry struct {
-	mu        sync.Mutex
-	count     int
-	instances []string // if empty, derived from count as ["self"] etc.
+	mu                sync.Mutex
+	count             int
+	instances         []string // if empty, derived from count as ["self"] etc.
+	deleteStaleCalls  int      // counts DeleteStaleInstances invocations
 }
 
 func newMockRegistry() *mockRegistry {
@@ -247,6 +268,13 @@ func (r *mockRegistry) AliveCount(_ context.Context, _ string) (int, error) {
 	defer r.mu.Unlock()
 
 	return r.count, nil
+}
+
+func (r *mockRegistry) DeleteStaleInstances(_ context.Context, _ time.Time) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.deleteStaleCalls++
+	return 0, nil
 }
 
 func (r *mockRegistry) AliveInstances(_ context.Context, _ string) ([]string, error) {

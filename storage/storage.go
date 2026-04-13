@@ -73,4 +73,11 @@ type Storage interface {
 	// If acquired, returns a release function. The caller must call release when done.
 	// Returns ErrLockNotAcquired if the lock is already held.
 	AcquireLock(ctx context.Context, key int64) (release func(), err error)
+
+	// DeleteOldSnapshots removes snapshots created before olderThan, except
+	// snapshots in the 'active' status (which are preserved regardless of age
+	// so the cluster can always recover the current authoritative version).
+	// Apply-log rows for the deleted snapshot versions are removed as well.
+	// Returns the number of snapshots deleted.
+	DeleteOldSnapshots(ctx context.Context, olderThan time.Time) (int, error)
 }
