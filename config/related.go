@@ -213,12 +213,9 @@ func (v *RelatedView[T, R]) recompute(parents []T, version Version) {
 		}
 	}
 
-	stored := make([]R, len(items))
-	copy(stored, items)
-
 	old := v.data.Load()
 	v.data.Store(&relatedSnapshot[R]{
-		items:   stored,
+		items:   items,
 		version: version,
 	})
 
@@ -228,7 +225,7 @@ func (v *RelatedView[T, R]) recompute(parents []T, version Version) {
 
 	for _, fn := range hooks {
 		if fn != nil {
-			fn(old.items, stored)
+			fn(old.items, items)
 		}
 	}
 }

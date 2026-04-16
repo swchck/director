@@ -113,7 +113,7 @@ type TranslatedView[T any, R any] struct {
 	source    *Collection[T]
 	transform func(T) R
 
-	data *View[R]
+	data *Collection[R]
 }
 
 // NewTranslatedView creates a view that transforms each item in the source collection.
@@ -124,7 +124,6 @@ type TranslatedView[T any, R any] struct {
 // This is a convenience wrapper that internally uses a helper collection and View.
 // For more control, use NewView directly with custom filter options.
 func NewTranslatedView[T any, R any](name string, source *Collection[T], transform func(T) R) *TranslatedView[T, R] {
-	// Create a derived collection to hold the transformed results.
 	derived := NewCollection[R](name + ":derived")
 
 	// Compute initial state.
@@ -137,14 +136,11 @@ func NewTranslatedView[T any, R any](name string, source *Collection[T], transfo
 		_ = derived.Swap(source.Version(), transformed)
 	})
 
-	// Wrap in a view for the full read API.
-	view := NewView(name, derived, nil)
-
 	return &TranslatedView[T, R]{
 		name:      name,
 		source:    source,
 		transform: transform,
-		data:      view,
+		data:      derived,
 	}
 }
 

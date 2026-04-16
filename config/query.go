@@ -59,6 +59,10 @@ func Offset[T any](n int) FilterOption[T] {
 
 // applyFilters runs all filter options in sequence.
 func applyFilters[T any](items []T, opts []FilterOption[T]) []T {
+	if len(opts) == 0 {
+		return items
+	}
+
 	result := make([]T, len(items))
 	copy(result, items)
 
