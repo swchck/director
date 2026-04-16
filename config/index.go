@@ -57,6 +57,7 @@ type IndexedView[T any, K comparable] struct {
 	persistenceTimeout time.Duration
 	onError            ErrorFunc
 	persistSem         chan struct{}
+	unsub              func()
 
 	data atomic.Pointer[indexSnapshot[K, T]]
 
@@ -94,7 +95,7 @@ func NewIndexedView[T any, K comparable](name string, source *Collection[T], key
 	v.recompute(source.All(), source.Version())
 
 	// Auto-update on source changes.
-	source.OnChange(func(_, newItems []T) {
+	v.unsub = source.OnChange(func(_, newItems []T) {
 		v.recompute(newItems, source.Version())
 	})
 
@@ -104,6 +105,16 @@ func NewIndexedView[T any, K comparable](name string, source *Collection[T], key
 // Name returns the view name.
 func (v *IndexedView[T, K]) Name() string {
 	return v.name
+}
+
+// Close unsubscribes the view from its source collection. After Close,
+// the view stops recomputing on source changes. It is safe to call
+// Close multiple times.
+func (v *IndexedView[T, K]) Close() {
+	if v.unsub != nil {
+		v.unsub()
+		v.unsub = nil
+	}
 }
 
 // Get returns all items for the given key, or nil if the key doesn't exist.
@@ -323,6 +334,7 @@ type IndexedViewT[T any, K comparable, V any] struct {
 	persistenceTimeout time.Duration
 	onError            ErrorFunc
 	persistSem         chan struct{}
+	unsub              func()
 
 	data atomic.Pointer[indexSnapshotT[K, V]]
 }
@@ -356,7 +368,7 @@ func NewIndexedViewT[T any, K comparable, V any](name string, source *Collection
 
 	v.recompute(source.All(), source.Version())
 
-	source.OnChange(func(_, newItems []T) {
+	v.unsub = source.OnChange(func(_, newItems []T) {
 		v.recompute(newItems, source.Version())
 	})
 
@@ -366,6 +378,16 @@ func NewIndexedViewT[T any, K comparable, V any](name string, source *Collection
 // Name returns the view name.
 func (v *IndexedViewT[T, K, V]) Name() string {
 	return v.name
+}
+
+// Close unsubscribes the view from its source collection. After Close,
+// the view stops recomputing on source changes. It is safe to call
+// Close multiple times.
+func (v *IndexedViewT[T, K, V]) Close() {
+	if v.unsub != nil {
+		v.unsub()
+		v.unsub = nil
+	}
 }
 
 // Get returns the values for the given key. O(1) lookup + slice copy.

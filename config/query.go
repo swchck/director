@@ -58,11 +58,8 @@ func Offset[T any](n int) FilterOption[T] {
 }
 
 // applyFilters runs all filter options in sequence.
+// The returned slice is always a new allocation safe to mutate.
 func applyFilters[T any](items []T, opts []FilterOption[T]) []T {
-	if len(opts) == 0 {
-		return items
-	}
-
 	result := make([]T, len(items))
 	copy(result, items)
 

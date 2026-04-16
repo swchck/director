@@ -648,3 +648,154 @@ func TestSingletonView_WithErrorHandler_OnPersistFailure(t *testing.T) {
 		t.Errorf("error handler error = %v, want to wrap 'save failed'", gotErr)
 	}
 }
+
+func TestView_Close_StopsRecomputing(t *testing.T) {
+	c := config.NewCollection[item]("items")
+	_ = c.Swap(v1(), []item{{ID: 1, Category: "a", Level: 10}})
+
+	view := config.NewView("a-items", c, nil)
+
+	if view.Count() != 1 {
+		t.Fatalf("initial Count() = %d, want 1", view.Count())
+	}
+
+	view.Close()
+
+	// After Close, source swaps should NOT update the view.
+	_ = c.Swap(v2(), []item{
+		{ID: 1, Category: "a", Level: 10},
+		{ID: 2, Category: "b", Level: 20},
+	})
+
+	if view.Count() != 1 {
+		t.Errorf("Count() after Close = %d, want 1 (should not recompute)", view.Count())
+	}
+}
+
+func TestView_Close_Idempotent(t *testing.T) {
+	c := config.NewCollection[item]("items")
+	view := config.NewView("items", c, nil)
+
+	// Should not panic on multiple Close calls.
+	view.Close()
+	view.Close()
+}
+
+func TestSingletonView_Close_StopsRecomputing(t *testing.T) {
+	s := config.NewSingleton[appConfig]("app_config")
+	_ = s.Swap(v1(), appConfig{MaxItems: 10})
+
+	sv := config.NewSingletonView("max-items", s,
+		func(c appConfig) int { return c.MaxItems },
+	)
+
+	val, ok := sv.Get()
+	if !ok || val != 10 {
+		t.Fatalf("initial Get() = %d/%v, want 10/true", val, ok)
+	}
+
+	sv.Close()
+
+	_ = s.Swap(v2(), appConfig{MaxItems: 20})
+
+	val, _ = sv.Get()
+	if val != 10 {
+		t.Errorf("Get() after Close = %d, want 10 (should not recompute)", val)
+	}
+}
+
+func TestView_Version_MatchesSource(t *testing.T) {
+	c := config.NewCollection[item]("items")
+	ver := v1()
+	_ = c.Swap(ver, []item{{ID: 1}})
+
+	view := config.NewView("all", c, nil)
+
+	if view.Version() != ver {
+		t.Errorf("Version() = %v, want %v", view.Version(), ver)
+	}
+
+	ver2 := v2()
+	_ = c.Swap(ver2, []item{{ID: 1}, {ID: 2}})
+
+	if view.Version() != ver2 {
+		t.Errorf("Version() after swap = %v, want %v", view.Version(), ver2)
+	}
+}
+
+func TestSingletonView_WithPersistenceTimeout(t *testing.T) {
+	sp := newSlowPersistence()
+
+	s := config.NewSingleton[appConfig]("app_config")
+	_ = s.Swap(v1(), appConfig{MaxItems: 42})
+
+	_ = config.NewSingletonView("sv-timeout", s,
+		func(c appConfig) int { return c.MaxItems },
+		config.WithSingletonViewPersistence[appConfig, int](sp),
+		config.WithSingletonViewPersistenceTimeout[appConfig, int](10*time.Millisecond),
+	)
+
+	select {
+	case err := <-sp.saveErr:
+		if err == nil {
+			t.Error("expected non-nil error from slow Save")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for persistence timeout to fire")
+	}
+}
+
+func TestView_FindMany(t *testing.T) {
+	c := config.NewCollection[item]("items")
+	_ = c.Swap(v1(), []item{
+		{ID: 1, Category: "a", Level: 10},
+		{ID: 2, Category: "b", Level: 20},
+		{ID: 3, Category: "a", Level: 30},
+	})
+
+	view := config.NewView("all", c, nil)
+
+	found := view.FindMany(func(i item) bool { return i.Category == "a" })
+	if len(found) != 2 {
+		t.Errorf("FindMany(category=a) = %d items, want 2", len(found))
+	}
+
+	none := view.FindMany(func(i item) bool { return i.Category == "z" })
+	if len(none) != 0 {
+		t.Errorf("FindMany(category=z) = %d items, want 0", len(none))
+	}
+}
+
+func TestView_Filter(t *testing.T) {
+	c := config.NewCollection[item]("items")
+	_ = c.Swap(v1(), []item{
+		{ID: 1, Category: "a", Level: 10},
+		{ID: 2, Category: "b", Level: 20},
+		{ID: 3, Category: "a", Level: 30},
+	})
+
+	view := config.NewView("all", c, nil)
+
+	filtered := view.Filter(
+		config.Where(func(i item) bool { return i.Category == "a" }),
+	)
+	if len(filtered) != 2 {
+		t.Errorf("Filter(category=a) = %d items, want 2", len(filtered))
+	}
+
+	// No args — should return safe copy of all items.
+	all := view.Filter()
+	if len(all) != 3 {
+		t.Errorf("Filter() = %d items, want 3", len(all))
+	}
+}
+
+func TestView_First_Empty(t *testing.T) {
+	c := config.NewCollection[item]("items")
+	view := config.NewView("empty", c, nil)
+
+	_, ok := view.First()
+	if ok {
+		t.Error("First() should return false on empty view")
+	}
+}

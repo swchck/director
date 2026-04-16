@@ -288,3 +288,21 @@ func TestSingleton_OnChange_Unsubscribe(t *testing.T) {
 		t.Errorf("hook fired after unsubscribe: calls=%d, want 1", calls)
 	}
 }
+
+func TestCollection_Filter_NoArgs_ReturnsSafeCopy(t *testing.T) {
+	c := config.NewCollection[item]("items")
+	_ = c.Swap(v1(), []item{{ID: 1, Name: "Original"}})
+
+	result := c.Filter()
+	if len(result) != 1 || result[0].Name != "Original" {
+		t.Fatalf("Filter() = %+v, want [{ID:1 Name:Original}]", result)
+	}
+
+	// Mutate the returned slice — must NOT affect the collection.
+	result[0].Name = "Mutated"
+
+	all := c.All()
+	if all[0].Name != "Original" {
+		t.Errorf("mutation via Filter() leaked into snapshot: Name = %q, want 'Original'", all[0].Name)
+	}
+}

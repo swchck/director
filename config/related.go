@@ -47,6 +47,8 @@ type RelatedView[T any, R any] struct {
 	source  *Collection[T]
 	extract func(T) []R
 	dedup   func(R, R) bool // optional: returns true if two items are the same
+	onError ErrorFunc
+	unsub   func()
 
 	data atomic.Pointer[relatedSnapshot[R]]
 
@@ -61,12 +63,25 @@ type RelatedViewOption[T any, R any] func(*RelatedView[T, R])
 // When M2M items appear under multiple parents, dedup prevents duplicates.
 // The function should return true if two items represent the same entity.
 //
+// Note: deduplication uses linear search per item, resulting in O(n²) time
+// complexity where n is the total number of related items. For collections
+// with thousands of related items, consider deduplicating in the extract
+// function or using an IndexedView instead.
+//
 // Example:
 //
 //	config.WithDedup[Article, Tag](func(a, b Tag) bool { return a.ID == b.ID })
 func WithDedup[T any, R any](fn func(a, b R) bool) RelatedViewOption[T, R] {
 	return func(v *RelatedView[T, R]) {
 		v.dedup = fn
+	}
+}
+
+// WithRelatedViewErrorHandler sets an error callback for hook panics.
+// Without this, recovered hook panics are silently ignored.
+func WithRelatedViewErrorHandler[T any, R any](fn ErrorFunc) RelatedViewOption[T, R] {
+	return func(v *RelatedView[T, R]) {
+		v.onError = fn
 	}
 }
 
@@ -95,7 +110,7 @@ func NewRelatedView[T any, R any](name string, source *Collection[T], extract fu
 	v.recompute(source.All(), source.Version())
 
 	// Auto-update when source changes.
-	source.OnChange(func(_, newItems []T) {
+	v.unsub = source.OnChange(func(_, newItems []T) {
 		v.recompute(newItems, source.Version())
 	})
 
@@ -105,6 +120,21 @@ func NewRelatedView[T any, R any](name string, source *Collection[T], extract fu
 // Name returns the view name.
 func (v *RelatedView[T, R]) Name() string {
 	return v.name
+}
+
+// Version returns the current snapshot version.
+func (v *RelatedView[T, R]) Version() Version {
+	return v.data.Load().version
+}
+
+// Close unsubscribes the view from its source collection. After Close,
+// the view stops recomputing on source changes. It is safe to call
+// Close multiple times.
+func (v *RelatedView[T, R]) Close() {
+	if v.unsub != nil {
+		v.unsub()
+		v.unsub = nil
+	}
 }
 
 // All returns a copy of all flattened related items.
@@ -223,9 +253,19 @@ func (v *RelatedView[T, R]) recompute(parents []T, version Version) {
 	hooks := v.hooks
 	v.mu.RUnlock()
 
+	wrappers := make([]func(), 0, len(hooks))
 	for _, fn := range hooks {
-		if fn != nil {
-			fn(old.items, items)
+		if fn == nil {
+			continue
+		}
+
+		fn := fn
+		wrappers = append(wrappers, func() { fn(old.items, items) })
+	}
+
+	if err := safeCallHooks(wrappers...); err != nil {
+		if v.onError != nil {
+			v.onError(v.name, err)
 		}
 	}
 }

@@ -1,7 +1,10 @@
 package config_test
 
 import (
+	"encoding/json"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/swchck/director/config"
 )
@@ -329,5 +332,330 @@ func TestTranslatedView_OnChange(t *testing.T) {
 	}
 	if newCount != 2 {
 		t.Errorf("new count = %d, want 2", newCount)
+	}
+}
+
+func TestTranslatedView_Close_StopsRecomputing(t *testing.T) {
+	type product struct {
+		ID           int
+		Translations []translation
+	}
+
+	type localized struct {
+		ID   int
+		Name string
+	}
+
+	c := config.NewCollection[product]("products")
+	_ = c.Swap(v1(), []product{
+		{ID: 1, Translations: []translation{{Lang: "en-US", Name: "Apple"}}},
+	})
+
+	enView := config.NewTranslatedView("products-en", c, func(p product) localized {
+		tr, _ := config.FindTranslation(p.Translations, langFn, "en-US")
+		return localized{ID: p.ID, Name: tr.Name}
+	})
+
+	if enView.Count() != 1 {
+		t.Fatalf("initial Count() = %d, want 1", enView.Count())
+	}
+
+	enView.Close()
+
+	_ = c.Swap(v2(), []product{
+		{ID: 1, Translations: []translation{{Lang: "en-US", Name: "Apple"}}},
+		{ID: 2, Translations: []translation{{Lang: "en-US", Name: "Banana"}}},
+	})
+
+	if enView.Count() != 1 {
+		t.Errorf("Count() after Close = %d, want 1 (should not recompute)", enView.Count())
+	}
+}
+
+func TestTranslatedView_WithPersistence_SavesOnRecompute(t *testing.T) {
+	type product struct {
+		ID   int
+		Name string
+	}
+	type localized struct {
+		ID   int
+		Name string
+	}
+
+	store := &mockPersistence{data: make(map[string][]byte)}
+
+	c := config.NewCollection[product]("products")
+	_ = c.Swap(v1(), []product{{ID: 1, Name: "Apple"}})
+
+	_ = config.NewTranslatedView("products-loc", c,
+		func(p product) localized { return localized(p) },
+		config.WithTranslatedViewPersistence[product, localized](store),
+	)
+
+	// Allow async persistence goroutine to complete.
+	time.Sleep(50 * time.Millisecond)
+
+	store.mu.Lock()
+	saved, ok := store.data["products-loc"]
+	store.mu.Unlock()
+
+	if !ok || len(saved) == 0 {
+		t.Error("expected persistence Save to be called with data")
+	}
+}
+
+func TestTranslatedView_WithPersistence_SavesOnSwap(t *testing.T) {
+	type product struct {
+		ID   int
+		Name string
+	}
+	type localized struct {
+		ID   int
+		Name string
+	}
+
+	store := &mockPersistence{data: make(map[string][]byte)}
+
+	c := config.NewCollection[product]("products")
+	_ = c.Swap(v1(), []product{{ID: 1, Name: "Apple"}})
+
+	_ = config.NewTranslatedView("products-loc", c,
+		func(p product) localized { return localized(p) },
+		config.WithTranslatedViewPersistence[product, localized](store),
+	)
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Swap triggers recompute which triggers save.
+	_ = c.Swap(v2(), []product{{ID: 1, Name: "Apple"}, {ID: 2, Name: "Banana"}})
+
+	time.Sleep(50 * time.Millisecond)
+
+	store.mu.Lock()
+	saved := store.data["products-loc"]
+	store.mu.Unlock()
+
+	// Should contain 2 serialized items.
+	if len(saved) == 0 {
+		t.Fatal("expected persistence Save to be called after swap")
+	}
+
+	var items []localized
+	if err := json.Unmarshal(saved, &items); err != nil {
+		t.Fatalf("unmarshal saved data: %v", err)
+	}
+	if len(items) != 2 {
+		t.Errorf("saved %d items, want 2", len(items))
+	}
+}
+
+func TestTranslatedView_Version_MatchesSource(t *testing.T) {
+	type product struct {
+		ID   int
+		Name string
+	}
+	type localized struct {
+		ID   int
+		Name string
+	}
+
+	c := config.NewCollection[product]("products")
+	ver := v1()
+	_ = c.Swap(ver, []product{{ID: 1, Name: "Apple"}})
+
+	tv := config.NewTranslatedView("products-loc", c, func(p product) localized {
+		return localized(p)
+	})
+
+	if tv.Version() != ver {
+		t.Errorf("Version() = %v, want %v", tv.Version(), ver)
+	}
+
+	ver2 := v2()
+	_ = c.Swap(ver2, []product{{ID: 1, Name: "Apple"}, {ID: 2, Name: "Banana"}})
+
+	if tv.Version() != ver2 {
+		t.Errorf("Version() after swap = %v, want %v", tv.Version(), ver2)
+	}
+}
+
+func TestTranslatedView_WithPersistence_WarmStart(t *testing.T) {
+	type product struct {
+		ID   int
+		Name string
+	}
+	type localized struct {
+		ID   int
+		Name string
+	}
+
+	store := &mockPersistence{data: make(map[string][]byte)}
+
+	// Pre-populate persistence with cached data.
+	cached, _ := json.Marshal([]localized{{ID: 99, Name: "Cached"}})
+	store.data["products-loc"] = cached
+
+	// Source is empty — but persistence has data.
+	c := config.NewCollection[product]("products")
+
+	tv := config.NewTranslatedView("products-loc", c,
+		func(p product) localized { return localized(p) },
+		config.WithTranslatedViewPersistence[product, localized](store),
+	)
+
+	// After constructor: source is empty → transform produces empty → overwrites warm start.
+	// This is expected: warm start is only useful until the first real sync.
+	// The warm start data is visible between loadFromPersistence and the initial compute.
+	// In production, source.All() returns real data, so the warm start is overwritten.
+	if tv.Count() != 0 {
+		t.Errorf("Count() = %d, want 0 (source is empty, transform overwrites warm start)", tv.Count())
+	}
+}
+
+func TestTranslatedView_WithPersistence_WarmStartWithData(t *testing.T) {
+	type product struct {
+		ID   int
+		Name string
+	}
+	type localized struct {
+		ID   int
+		Name string
+	}
+
+	store := &mockPersistence{data: make(map[string][]byte)}
+
+	// Pre-populate persistence.
+	cached, _ := json.Marshal([]localized{{ID: 1, Name: "Old"}})
+	store.data["products-loc"] = cached
+
+	// Source has data — persistence value should be overwritten by transform.
+	c := config.NewCollection[product]("products")
+	_ = c.Swap(v1(), []product{{ID: 1, Name: "Fresh"}})
+
+	tv := config.NewTranslatedView("products-loc", c,
+		func(p product) localized { return localized(p) },
+		config.WithTranslatedViewPersistence[product, localized](store),
+	)
+
+	if tv.Count() != 1 {
+		t.Fatalf("Count() = %d, want 1", tv.Count())
+	}
+
+	item, ok := tv.First()
+	if !ok || item.Name != "Fresh" {
+		t.Errorf("First() = %+v, want {ID:1, Name:Fresh}", item)
+	}
+}
+
+func TestTranslatedView_WithErrorHandler_OnPersistFailure(t *testing.T) {
+	type product struct {
+		ID   int
+		Name string
+	}
+	type localized struct {
+		ID   int
+		Name string
+	}
+
+	var mu sync.Mutex
+	var capturedErr error
+
+	c := config.NewCollection[product]("products")
+	_ = c.Swap(v1(), []product{{ID: 1, Name: "Apple"}})
+
+	_ = config.NewTranslatedView("tv-err", c,
+		func(p product) localized { return localized(p) },
+		config.WithTranslatedViewPersistence[product, localized](&failingPersistence{}),
+		config.WithTranslatedViewErrorHandler[product, localized](func(_ string, err error) {
+			mu.Lock()
+			capturedErr = err
+			mu.Unlock()
+		}),
+	)
+
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if capturedErr == nil {
+		t.Error("expected error handler to be called")
+	}
+}
+
+func TestTranslatedView_Close_StopsPersistence(t *testing.T) {
+	type product struct {
+		ID   int
+		Name string
+	}
+	type localized struct {
+		ID   int
+		Name string
+	}
+
+	store := &mockPersistence{data: make(map[string][]byte)}
+
+	c := config.NewCollection[product]("products")
+	_ = c.Swap(v1(), []product{{ID: 1, Name: "Apple"}})
+
+	tv := config.NewTranslatedView("products-loc", c,
+		func(p product) localized { return localized(p) },
+		config.WithTranslatedViewPersistence[product, localized](store),
+	)
+
+	// Wait for initial persistence write.
+	time.Sleep(50 * time.Millisecond)
+
+	tv.Close()
+
+	// Clear the store to detect new writes.
+	store.mu.Lock()
+	delete(store.data, "products-loc")
+	store.mu.Unlock()
+
+	// Swap source after Close — should NOT trigger persistence.
+	_ = c.Swap(v2(), []product{{ID: 1, Name: "Apple"}, {ID: 2, Name: "Banana"}})
+
+	time.Sleep(50 * time.Millisecond)
+
+	store.mu.Lock()
+	_, saved := store.data["products-loc"]
+	store.mu.Unlock()
+
+	if saved {
+		t.Error("persistence Save should not be called after Close")
+	}
+}
+
+func TestTranslatedView_WithPersistenceTimeout(t *testing.T) {
+	type product struct {
+		ID   int
+		Name string
+	}
+	type localized struct {
+		ID   int
+		Name string
+	}
+
+	sp := newSlowPersistence()
+
+	c := config.NewCollection[product]("products")
+	_ = c.Swap(v1(), []product{{ID: 1, Name: "Apple"}})
+
+	_ = config.NewTranslatedView("tv-timeout", c,
+		func(p product) localized { return localized(p) },
+		config.WithTranslatedViewPersistence[product, localized](sp),
+		config.WithTranslatedViewPersistenceTimeout[product, localized](10*time.Millisecond),
+	)
+
+	// slowPersistence blocks in Save until context is cancelled.
+	// With a 10ms timeout, Save should receive a context.DeadlineExceeded.
+	select {
+	case err := <-sp.saveErr:
+		if err == nil {
+			t.Error("expected non-nil error from slow Save")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for persistence timeout to fire")
 	}
 }

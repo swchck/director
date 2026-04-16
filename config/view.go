@@ -59,6 +59,7 @@ type View[T any] struct {
 	persistenceTimeout time.Duration
 	onError            ErrorFunc
 	persistSem         chan struct{}
+	unsub              func()
 
 	data atomic.Pointer[viewSnapshot[T]]
 
@@ -111,7 +112,7 @@ func NewView[T any](name string, source *Collection[T], filters []FilterOption[T
 	v.recompute(source.All(), source.Version())
 
 	// Register for future updates.
-	source.OnChange(func(_, newItems []T) {
+	v.unsub = source.OnChange(func(_, newItems []T) {
 		v.recompute(newItems, source.Version())
 	})
 
@@ -121,6 +122,22 @@ func NewView[T any](name string, source *Collection[T], filters []FilterOption[T
 // Name returns the view name.
 func (v *View[T]) Name() string {
 	return v.name
+}
+
+// Version returns the current snapshot version.
+func (v *View[T]) Version() Version {
+	return v.data.Load().version
+}
+
+// Close unsubscribes the view from its source collection. After Close,
+// the view stops recomputing on source changes. It is safe to call
+// Close multiple times. Reads remain valid after Close but return
+// stale data.
+func (v *View[T]) Close() {
+	if v.unsub != nil {
+		v.unsub()
+		v.unsub = nil
+	}
 }
 
 // All returns a copy of the cached view items.
@@ -202,10 +219,17 @@ func (v *View[T]) OnChange(fn func(old, new []T)) func() {
 
 // recompute applies the view's filter pipeline and atomically swaps the result.
 func (v *View[T]) recompute(sourceItems []T, version Version) {
-	items := applyFilters(sourceItems, v.filters)
-
-	stored := make([]T, len(items))
-	copy(stored, items)
+	var stored []T
+	if len(v.filters) > 0 {
+		// applyFilters returns a new slice; copy it to own the data.
+		items := applyFilters(sourceItems, v.filters)
+		stored = make([]T, len(items))
+		copy(stored, items)
+	} else {
+		// No filters — skip applyFilters, just copy source directly.
+		stored = make([]T, len(sourceItems))
+		copy(stored, sourceItems)
+	}
 
 	old := v.data.Swap(&viewSnapshot[T]{
 		items:   stored,
@@ -312,6 +336,7 @@ type SingletonView[T any, R any] struct {
 	persistenceTimeout time.Duration
 	onError            ErrorFunc
 	persistSem         chan struct{}
+	unsub              func()
 
 	data atomic.Pointer[singletonViewSnapshot[R]]
 }
@@ -378,7 +403,7 @@ func NewSingletonView[T any, R any](name string, source *Singleton[T], transform
 	}
 
 	// Register for updates.
-	source.OnChange(func(_, newVal *T) {
+	v.unsub = source.OnChange(func(_, newVal *T) {
 		if newVal != nil {
 			v.recompute(*newVal, source.Version())
 		}
@@ -401,6 +426,16 @@ func (v *SingletonView[T, R]) Get() (R, bool) {
 // Name returns the view name.
 func (v *SingletonView[T, R]) Name() string {
 	return v.name
+}
+
+// Close unsubscribes the view from its source singleton. After Close,
+// the view stops recomputing on source changes. It is safe to call
+// Close multiple times.
+func (v *SingletonView[T, R]) Close() {
+	if v.unsub != nil {
+		v.unsub()
+		v.unsub = nil
+	}
 }
 
 func (v *SingletonView[T, R]) recompute(source T, version Version) {
@@ -486,6 +521,10 @@ type CompositeView[T any] struct {
 //
 // dedup is optional — if nil, no deduplication is performed and results are concatenated.
 // If provided, it should return true when two items represent the same entity.
+//
+// Note: when dedup is set, deduplication uses linear search per item, resulting
+// in O(n²) time complexity where n is the total number of items across all views.
+// For large datasets, consider pre-filtering at the View level to minimize overlap.
 func NewCompositeView[T any](name string, dedup func(a, b T) bool, views ...*View[T]) *CompositeView[T] {
 	return &CompositeView[T]{
 		name:  name,

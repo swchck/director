@@ -245,6 +245,39 @@ func TestRelatedView_FindMany(t *testing.T) {
 	}
 }
 
+func TestRelatedView_RecoversPanicInHook(t *testing.T) {
+	c := config.NewCollection[articleWithTags]("articles")
+	_ = c.Swap(v1(), []articleWithTags{
+		{ID: 1, Tags: []tag{{ID: 10, Priority: 100}}},
+	})
+
+	var errCaught error
+	allTags := config.NewRelatedView("tags", c,
+		func(b articleWithTags) []tag { return b.Tags },
+		config.WithRelatedViewErrorHandler[articleWithTags, tag](func(_ string, err error) {
+			errCaught = err
+		}),
+	)
+
+	allTags.OnChange(func(_, _ []tag) {
+		panic("hook exploded")
+	})
+
+	// Swap the source — RelatedView recompute should recover the panic.
+	_ = c.Swap(v2(), []articleWithTags{
+		{ID: 1, Tags: []tag{{ID: 10, Priority: 100}, {ID: 11, Priority: 200}}},
+	})
+
+	if errCaught == nil {
+		t.Fatal("expected error from panicking hook")
+	}
+
+	// Data should still be updated despite the panic.
+	if allTags.Count() != 2 {
+		t.Errorf("Count() = %d, want 2 (recompute should commit before hooks)", allTags.Count())
+	}
+}
+
 func TestRelatedView_OnChange(t *testing.T) {
 	c := config.NewCollection[articleWithTags]("articles")
 	_ = c.Swap(v1(), []articleWithTags{
@@ -276,5 +309,85 @@ func TestRelatedView_OnChange(t *testing.T) {
 	}
 	if newCount != 3 {
 		t.Errorf("new count = %d, want 3", newCount)
+	}
+}
+
+func TestRelatedView_Close_StopsRecomputing(t *testing.T) {
+	c := config.NewCollection[articleWithTags]("articles")
+	_ = c.Swap(v1(), []articleWithTags{
+		{ID: 1, Tags: []tag{{ID: 10, Priority: 100}}},
+	})
+
+	allTags := config.NewRelatedView("tags", c,
+		func(b articleWithTags) []tag { return b.Tags },
+	)
+
+	if allTags.Count() != 1 {
+		t.Fatalf("initial Count() = %d, want 1", allTags.Count())
+	}
+
+	allTags.Close()
+
+	_ = c.Swap(v2(), []articleWithTags{
+		{ID: 1, Tags: []tag{{ID: 10, Priority: 100}, {ID: 11, Priority: 200}}},
+	})
+
+	if allTags.Count() != 1 {
+		t.Errorf("Count() after Close = %d, want 1 (should not recompute)", allTags.Count())
+	}
+}
+
+func TestRelatedView_Version_MatchesSource(t *testing.T) {
+	c := config.NewCollection[articleWithTags]("articles")
+	ver := v1()
+	_ = c.Swap(ver, []articleWithTags{
+		{ID: 1, Tags: []tag{{ID: 10, Priority: 100}}},
+	})
+
+	allTags := config.NewRelatedView("tags", c,
+		func(b articleWithTags) []tag { return b.Tags },
+	)
+
+	if allTags.Version() != ver {
+		t.Errorf("Version() = %v, want %v", allTags.Version(), ver)
+	}
+
+	ver2 := v2()
+	_ = c.Swap(ver2, []articleWithTags{
+		{ID: 1, Tags: []tag{{ID: 10, Priority: 100}, {ID: 11, Priority: 200}}},
+	})
+
+	if allTags.Version() != ver2 {
+		t.Errorf("Version() after swap = %v, want %v", allTags.Version(), ver2)
+	}
+}
+
+func TestRelatedView_PanicInOneHookDoesNotBlockOthers(t *testing.T) {
+	c := config.NewCollection[articleWithTags]("articles")
+	_ = c.Swap(v1(), []articleWithTags{
+		{ID: 1, Tags: []tag{{ID: 10, Priority: 100}}},
+	})
+
+	allTags := config.NewRelatedView("tags", c,
+		func(b articleWithTags) []tag { return b.Tags },
+	)
+
+	// First hook panics.
+	allTags.OnChange(func(_, _ []tag) {
+		panic("first hook exploded")
+	})
+
+	// Second hook should still run.
+	var secondCalled bool
+	allTags.OnChange(func(_, _ []tag) {
+		secondCalled = true
+	})
+
+	_ = c.Swap(v2(), []articleWithTags{
+		{ID: 1, Tags: []tag{{ID: 10, Priority: 100}, {ID: 11, Priority: 200}}},
+	})
+
+	if !secondCalled {
+		t.Error("second hook should run even when first panics")
 	}
 }
