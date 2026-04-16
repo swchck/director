@@ -35,7 +35,7 @@ Used by the Manager to cache full collection snapshots in Redis.
 import rediscache "github.com/swchck/director/cache/redis"
 
 redisCache := rediscache.NewCache(redisClient,
-    rediscache.WithTTL(15 * time.Minute),
+    rediscache.WithTTL(15 * time.Minute),   // default: 10 minutes
     rediscache.WithKeyPrefix("myapp:config:"),
 )
 

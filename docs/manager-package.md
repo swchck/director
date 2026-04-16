@@ -210,26 +210,14 @@ The debounce accumulates changed collections. When the timer fires, all accumula
 
 ## Event Loop
 
-```
-+----------------------------------------------------------+
-|                      Event Loop                          |
-|                                                          |
-|  +-- Poll ticker --+-> syncAll() -> leader protocol     |
-|  |   (5 min)       |   or no-op if follower             |
-|  +-----------------+                                     |
-|                                                          |
-|  +-- Heartbeat ----+-> registry.Heartbeat()             |
-|  |   (10 sec)      |                                    |
-|  +-----------------+                                     |
-|                                                          |
-|  +-- Notification -+-> handleEvent()                    |
-|  |   channel       |   +-- "sync" -> load snapshot, Swap|
-|  +-----------------+   +-- "rollback" -> revert         |
-|                                                          |
-|  +-- WebSocket ----+-> debounce (2s) -> syncOneForced() |
-|  |   events        |   per collection                   |
-|  +-----------------+                                     |
-+----------------------------------------------------------+
+```mermaid
+flowchart LR
+    subgraph Event Loop
+        PT["Poll ticker (5m)"] -->|syncAll| LP[leader protocol or no-op]
+        HB["Heartbeat (10s)"] --> RH[registry.Heartbeat]
+        NC[Notification channel] -->|handleEvent| EH["sync → load snapshot, Swap<br/>rollback → revert"]
+        WS[WebSocket events] -->|"debounce (2s)"| FS[forced sync per collection]
+    end
 ```
 
 ## Type Erasure

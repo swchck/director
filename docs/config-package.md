@@ -80,19 +80,15 @@ filtered := foodByLevel.Filter(config.Limit[Business](10))
 
 ### How View Recomputation Works
 
-```
-Collection.Swap(v2, newItems)
-    |
-    +-- atomic pointer swap (data committed)
-    |
-    +-- fire OnChange hooks
-            |
-            +-- View.recompute(newItems, v2)
-                    |
-                    +-- apply filters: Where -> SortBy -> Limit
-                    +-- atomic pointer swap (view updated)
-                    +-- async: save to persistence (if configured)
-                    +-- fire View.OnChange hooks
+```mermaid
+flowchart TD
+    A["Collection.Swap(v2, newItems)"] --> B[atomic pointer swap]
+    B --> C[fire OnChange hooks]
+    C --> D["View.recompute(newItems, v2)"]
+    D --> E[apply filters: Where → SortBy → Limit]
+    E --> F[atomic pointer swap — view updated]
+    F --> G[async: save to persistence]
+    F --> H[fire View.OnChange hooks]
 ```
 
 The chain is synchronous from Collection.Swap through to the View update. By the time `Swap` returns, all views derived from that collection are already up-to-date.
@@ -251,7 +247,7 @@ levelsByBiz := config.NewIndexedViewT("levels-by-biz", businesses, keyFn, valueF
 
 ## Translations (`translation.go`)
 
-Helpers for working with Directus translated collections.
+Helpers for working with translated collections.
 
 ### In-memory lookup
 
@@ -296,6 +292,20 @@ enProducts := config.NewTranslatedView("products-en", products,
 // Auto-updates when source products collection changes
 ```
 
+### Persistence
+
+TranslatedView supports the same persistence pattern as other views:
+
+```go
+enProducts := config.NewTranslatedView("products-en", products, transformFn,
+    config.WithTranslatedViewPersistence[Product, LocalizedProduct](viewStore),
+    config.WithTranslatedViewErrorHandler[Product, LocalizedProduct](func(name string, err error) {
+        log.Printf("translated view %s: %v", name, err)
+    }),
+    config.WithTranslatedViewPersistenceTimeout[Product, LocalizedProduct](5*time.Second),
+)
+```
+
 ## RelatedView (`related.go`)
 
 Extracts and flattens nested M2M/O2M data from a parent Collection into a queryable view:
@@ -314,11 +324,49 @@ expensive := allLevels.Filter(
 level, ok := allLevels.Find(func(l Level) bool { return l.ID == 5 })
 ```
 
-`WithDedup` removes duplicate related items that appear under multiple parents (common with M2M).
+`WithDedup` removes duplicate related items that appear under multiple parents (common with M2M). Note: deduplication uses linear search per item (O(n²)). For large collections, consider deduplicating in the extract function instead.
+
+### Error Handling
+
+```go
+allLevels := config.NewRelatedView("levels", businesses, extractFn,
+    config.WithRelatedViewErrorHandler[Business, Level](func(name string, err error) {
+        log.Printf("related view %s: %v", name, err)
+    }),
+)
+```
+
+## Close and Version
+
+All view types (`View`, `SingletonView`, `IndexedView`, `IndexedViewT`, `TranslatedView`, `RelatedView`) support:
+
+- **`Close()`** — unsubscribes from the source. The view stops recomputing on source changes. Reads remain valid but return stale data. Safe to call multiple times.
+- **`Version()`** — returns the current snapshot version, matching the source's version at the time of the last recomputation.
+
+```go
+view := config.NewView("items", collection, filters)
+defer view.Close()
+
+ver := view.Version()
+```
+
+## ReadableCollection Interface
+
+`ReadableCollection[T]` is a read-only interface implemented by `Collection[T]`, `View[T]`, `TranslatedView[T, R]`, and `RelatedView[T, R]`. Use it to accept any of these types without exposing `Swap()`:
+
+```go
+func processItems(src config.ReadableCollection[Product]) {
+    for _, p := range src.All() {
+        // works with Collection, View, TranslatedView, or RelatedView
+    }
+}
+```
+
+`ReadableSingleton[T]` provides the same for `Singleton[T]`.
 
 ## Version (`version.go`)
 
-Opaque version type based on `date_updated` timestamps. RFC3339 format ensures deterministic comparison across replicas -- same Directus data produces the same version string everywhere.
+Opaque version type based on `date_updated` timestamps. RFC3339 format ensures deterministic comparison across replicas -- same source data produces the same version string everywhere.
 
 ## Full View Type Summary
 

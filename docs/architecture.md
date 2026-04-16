@@ -4,25 +4,15 @@
 
 ## High-Level Flow
 
-```
-+-----------+     poll / WS      +---------------+
-| Directus  | <---------------- |   Manager     |
-|  (CMS)    | ----------------> |  (leader)     |
-+-----------+    fetch items     +------+--------+
-                                       |
-                        +--------------+--------------+
-                        v              v              v
-                  +-----------+  +-----------+  +-----------+
-                  | Postgres  |  |  Redis    |  |  Notify   |
-                  | snapshot  |  |  cache    |  | channel   |
-                  +-----------+  +-----------+  +-----+-----+
-                                                      |
-                                       +--------------+--------------+
-                                       v              v              v
-                                 +-----------+  +-----------+  +-----------+
-                                 | Replica   |  | Replica   |  | Replica   |
-                                 |(follower) |  |(follower) |  |(follower) |
-                                 +-----------+  +-----------+  +-----------+
+```mermaid
+flowchart TD
+    Source["Data Source<br/>(CMS / API)"] <-->|"poll / WS<br/>fetch items"| Manager["Manager<br/>(leader)"]
+    Manager --> Postgres[Postgres snapshot]
+    Manager --> Redis[Redis cache]
+    Manager --> Notify[Notify channel]
+    Notify --> R1["Replica (follower)"]
+    Notify --> R2["Replica (follower)"]
+    Notify --> R3["Replica (follower)"]
 ```
 
 ## Package Map
@@ -41,17 +31,11 @@
 
 ## Package Dependency Graph
 
-```
-example/  cmd/
-   |       |
-   v       v
- manager ----------+
-   |   |   |   |   |
-   v   v   v   v   v
-config directus storage notify registry cache
-   |
-   v
- source
+```mermaid
+flowchart TD
+    example & cmd --> manager
+    manager --> config & directus & storage & notify & registry & cache
+    config --> source
 ```
 
 No circular dependencies. Each package can be used independently.
@@ -99,22 +83,20 @@ Two protocols are available, selected per manager via `Options.RequireUnanimousA
 
 ## View Update Chain
 
-```
-Collection.Swap(v2, newItems)
-    +-- atomic pointer swap (data committed)
-    +-- fire OnChange hooks
-            +-- View.recompute() -> filter + sort -> atomic swap
-            |       +-- async: persist to Redis/memory (if configured)
-            |       +-- fire View.OnChange hooks
-            +-- IndexedView.recompute() -> group by key -> atomic swap
-            |       +-- async: persist to Redis/memory (if configured)
-            |       +-- fire IndexedView.OnChange hooks
-            +-- IndexedViewT.recompute() -> group + transform -> atomic swap
-            |       +-- async: persist (if configured)
-            +-- RelatedView.recompute() -> extract + flatten -> atomic swap
-            +-- TranslatedView -> derived Collection.Swap -> View update
-            +-- SingletonView.recompute() -> transform -> atomic swap
-                    +-- async: persist (if configured)
+```mermaid
+flowchart TD
+    Swap["Collection.Swap(v2, newItems)"] --> Atomic[atomic pointer swap]
+    Atomic --> Hooks[fire OnChange hooks]
+    Hooks --> V["View.recompute → filter + sort → atomic swap"]
+    Hooks --> IV["IndexedView.recompute → group by key → atomic swap"]
+    Hooks --> IVT["IndexedViewT.recompute → group + transform → atomic swap"]
+    Hooks --> RV["RelatedView.recompute → extract + flatten → atomic swap"]
+    Hooks --> TV["TranslatedView → derived Collection.Swap"]
+    Hooks --> SV["SingletonView.recompute → transform → atomic swap"]
+    V -.->|async| VP[persist to Redis/memory]
+    IV -.->|async| IVP[persist]
+    TV -.->|async| TVP[persist]
+    SV -.->|async| SVP[persist]
 ```
 
 All updates are synchronous within the Swap call. By the time Swap returns,
@@ -123,25 +105,20 @@ asynchronously after the swap -- they never delay data availability.
 
 ## View Type Hierarchy
 
-```
-                    Collection[T]
-                         |
-          +--------------+--------------+---------+
-          |              |              |         |
-     View[T]    IndexedView[T,K]  IndexedViewT  RelatedView
-          |              |         [T,K,V]
-          |              |
-   CompositeView[T]    (merged)
-   (merges Views)
-
-                    Singleton[T]
-                         |
-                 SingletonView[T,R]
-
-          TranslatedView (Collection -> Collection via transform)
+```mermaid
+flowchart TD
+    C["Collection[T]"] --> V["View[T]"]
+    C --> IV["IndexedView[T,K]"]
+    C --> IVT["IndexedViewT[T,K,V]"]
+    C --> RV["RelatedView[T,R]"]
+    C --> TV["TranslatedView[T,R]"]
+    V --> CV["CompositeView[T]<br/>(merges Views)"]
+    S["Singleton[T]"] --> SV["SingletonView[T,R]"]
 ```
 
 All view types share:
 - Lock-free reads via `atomic.Pointer`
 - Synchronous recomputation on source change
 - Optional async persistence (`ViewPersistence` interface)
+- `Close()` to unsubscribe from source changes
+- `Version()` to read current snapshot version
