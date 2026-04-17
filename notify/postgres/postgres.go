@@ -211,10 +211,18 @@ func (c *Channel) listen(ctx context.Context, ch chan<- notify.Event) error {
 			continue
 		}
 
+		// Non-blocking send: drop the event if the buffer is full.
+		// This prevents the listen goroutine from blocking, which would
+		// stop health check pings and delay dead-connection detection.
+		// Notifications are idempotent — the manager reconciles state
+		// on the next poll cycle regardless.
 		select {
 		case ch <- event:
-		case <-ctx.Done():
-			return ctx.Err()
+		default:
+			c.logger.Warn("notify/postgres: event dropped, channel buffer full",
+				dlog.String("collection", event.Collection),
+				dlog.String("action", string(event.Action)),
+			)
 		}
 	}
 }
