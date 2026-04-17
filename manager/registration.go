@@ -151,6 +151,7 @@ type collectionReg[T any] struct {
 	src       source.CollectionSource[T]
 	logger    dlog.Logger
 	metrics   Metrics
+	defaults  func(T) T
 	validator func([]T) error
 
 	stageMu sync.Mutex
@@ -190,11 +191,23 @@ func (r *collectionReg[T]) shouldReport(ver config.Version, kind string) bool {
 	return r.failure.shouldLog(ver, kind)
 }
 
+func (r *collectionReg[T]) applyDefaults(items []T) []T {
+	if r.defaults == nil {
+		return items
+	}
+	for i := range items {
+		items[i] = r.defaults(items[i])
+	}
+	return items
+}
+
 func (r *collectionReg[T]) fetchAndSwap(ctx context.Context, ver config.Version) ([]byte, error) {
 	items, err := r.src.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("manager: fetch %s: %w", r.cfg.Name(), err)
 	}
+
+	items = r.applyDefaults(items)
 
 	if r.validator != nil {
 		if vErr := r.validator(items); vErr != nil {
@@ -232,6 +245,8 @@ func (r *collectionReg[T]) swapFromBytes(ver config.Version, data []byte) error 
 		return fmt.Errorf("manager: unmarshal %s: %w", r.cfg.Name(), err)
 	}
 
+	items = r.applyDefaults(items)
+
 	if r.validator != nil {
 		if vErr := r.validator(items); vErr != nil {
 			r.reportFailure(ver, "validator", vErr)
@@ -263,6 +278,8 @@ func (r *collectionReg[T]) fetchAndStage(ctx context.Context, ver config.Version
 		return nil, nil, fmt.Errorf("manager: fetch %s: %w", r.cfg.Name(), err)
 	}
 
+	items = r.applyDefaults(items)
+
 	if r.validator != nil {
 		if vErr := r.validator(items); vErr != nil {
 			r.reportFailure(ver, "validator", vErr)
@@ -292,6 +309,8 @@ func (r *collectionReg[T]) stageFromBytes(ver config.Version, roundID string, da
 	if err := json.Unmarshal(data, &items); err != nil {
 		return nil, fmt.Errorf("manager: unmarshal %s: %w", r.cfg.Name(), err)
 	}
+
+	items = r.applyDefaults(items)
 
 	if r.validator != nil {
 		if vErr := r.validator(items); vErr != nil {
@@ -417,6 +436,7 @@ type singletonReg[T any] struct {
 	src       source.SingletonSource[T]
 	logger    dlog.Logger
 	metrics   Metrics
+	defaults  func(T) T
 	validator func(*T) error
 
 	stageMu sync.Mutex
@@ -456,11 +476,20 @@ func (r *singletonReg[T]) shouldReport(ver config.Version, kind string) bool {
 	return r.failure.shouldLog(ver, kind)
 }
 
+func (r *singletonReg[T]) applyDefault(item *T) {
+	if r.defaults == nil || item == nil {
+		return
+	}
+	*item = r.defaults(*item)
+}
+
 func (r *singletonReg[T]) fetchAndSwap(ctx context.Context, ver config.Version) ([]byte, error) {
 	item, err := r.src.Get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("manager: fetch singleton %s: %w", r.cfg.Name(), err)
 	}
+
+	r.applyDefault(item)
 
 	if r.validator != nil {
 		if vErr := r.validator(item); vErr != nil {
@@ -494,6 +523,8 @@ func (r *singletonReg[T]) swapFromBytes(ver config.Version, data []byte) error {
 		return fmt.Errorf("manager: unmarshal singleton %s: %w", r.cfg.Name(), err)
 	}
 
+	r.applyDefault(&item)
+
 	if r.validator != nil {
 		if vErr := r.validator(&item); vErr != nil {
 			r.reportFailure(ver, "validator", vErr)
@@ -520,6 +551,8 @@ func (r *singletonReg[T]) fetchAndStage(ctx context.Context, ver config.Version,
 	if err != nil {
 		return nil, nil, fmt.Errorf("manager: fetch singleton %s: %w", r.cfg.Name(), err)
 	}
+
+	r.applyDefault(item)
 
 	if r.validator != nil {
 		if vErr := r.validator(item); vErr != nil {
@@ -549,6 +582,8 @@ func (r *singletonReg[T]) stageFromBytes(ver config.Version, roundID string, dat
 	if err := json.Unmarshal(data, &item); err != nil {
 		return nil, fmt.Errorf("manager: unmarshal singleton %s: %w", r.cfg.Name(), err)
 	}
+
+	r.applyDefault(&item)
 
 	if r.validator != nil {
 		if vErr := r.validator(&item); vErr != nil {
@@ -668,6 +703,33 @@ type CollectionOption[T any] func(*collectionReg[T])
 
 // SingletonOption configures a registered singleton.
 type SingletonOption[T any] func(*singletonReg[T])
+
+// WithCollectionDefaults installs a per-item defaults function for a collection.
+//
+// The function is called for each item after fetch/deserialize and before
+// validation. It receives the item and returns it with default values applied
+// for any zero-valued fields.
+//
+// Example:
+//
+//	manager.WithCollectionDefaults(func(p Product) Product {
+//	    if p.Currency == "" { p.Currency = "USD" }
+//	    if p.MaxStock == 0 { p.MaxStock = 100 }
+//	    return p
+//	})
+func WithCollectionDefaults[T any](fn func(T) T) CollectionOption[T] {
+	return func(r *collectionReg[T]) {
+		r.defaults = fn
+	}
+}
+
+// WithSingletonDefaults installs a defaults function for a singleton.
+// See WithCollectionDefaults for full semantics.
+func WithSingletonDefaults[T any](fn func(T) T) SingletonOption[T] {
+	return func(r *singletonReg[T]) {
+		r.defaults = fn
+	}
+}
 
 // WithCollectionValidator installs a pre-apply validator for a collection.
 //

@@ -424,3 +424,172 @@ func TestMockCollectionSource_ImplementsInterface(t *testing.T) {
 func TestMockSingletonSource_ImplementsInterface(t *testing.T) {
 	var _ source.SingletonSource[siteSettings] = &mockSingletonSource[siteSettings]{}
 }
+
+func TestWithCollectionDefaults_AppliesDefaults(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	mockSrc := &mockCollectionSource[product]{
+		items: []product{
+			{ID: 1, Name: "Widget", Price: 0},  // Price missing
+			{ID: 2, Name: "Gadget", Price: 200}, // Price set
+		},
+		lastModified: now,
+	}
+
+	store := newMockStorage()
+	notif := newMockNotifier()
+	reg := newMockRegistry()
+
+	products := config.NewCollection[product]("products")
+
+	mgr := manager.New(store, notif, reg, manager.Options{
+		PollInterval:             time.Hour,
+		WaitConfirmationsTimeout: time.Second,
+		ServiceName:              "test-svc",
+	})
+
+	manager.RegisterCollectionSource(mgr, products, mockSrc,
+		manager.WithCollectionDefaults(func(p product) product {
+			if p.Price == 0 {
+				p.Price = 99
+			}
+			return p
+		}),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+
+	all := products.All()
+	if len(all) != 2 {
+		t.Fatalf("Count() = %d, want 2", len(all))
+	}
+
+	if all[0].Price != 99 {
+		t.Errorf("item 0 Price = %d, want 99 (default)", all[0].Price)
+	}
+	if all[1].Price != 200 {
+		t.Errorf("item 1 Price = %d, want 200 (original)", all[1].Price)
+	}
+
+	cancel()
+	<-errCh
+}
+
+func TestWithSingletonDefaults_AppliesDefaults(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	val := siteSettings{SiteName: "My Site", Locale: ""} // Locale missing
+	mockSrc := &mockSingletonSource[siteSettings]{
+		value:        &val,
+		lastModified: now,
+	}
+
+	store := newMockStorage()
+	notif := newMockNotifier()
+	reg := newMockRegistry()
+
+	settings := config.NewSingleton[siteSettings]("settings")
+
+	mgr := manager.New(store, notif, reg, manager.Options{
+		PollInterval:             time.Hour,
+		WaitConfirmationsTimeout: time.Second,
+		ServiceName:              "test-svc",
+	})
+
+	manager.RegisterSingletonSource(mgr, settings, mockSrc,
+		manager.WithSingletonDefaults(func(s siteSettings) siteSettings {
+			if s.Locale == "" {
+				s.Locale = "en-US"
+			}
+			return s
+		}),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+
+	got, ok := settings.Get()
+	if !ok {
+		t.Fatal("settings.Get() returned false")
+	}
+
+	if got.SiteName != "My Site" {
+		t.Errorf("SiteName = %q, want 'My Site'", got.SiteName)
+	}
+	if got.Locale != "en-US" {
+		t.Errorf("Locale = %q, want 'en-US' (default)", got.Locale)
+	}
+
+	cancel()
+	<-errCh
+}
+
+func TestWithCollectionDefaults_RunsBeforeValidator(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	mockSrc := &mockCollectionSource[product]{
+		items:        []product{{ID: 1, Name: "Widget", Price: 0}},
+		lastModified: now,
+	}
+
+	store := newMockStorage()
+	notif := newMockNotifier()
+	reg := newMockRegistry()
+
+	products := config.NewCollection[product]("products")
+
+	mgr := manager.New(store, notif, reg, manager.Options{
+		PollInterval:             time.Hour,
+		WaitConfirmationsTimeout: time.Second,
+		ServiceName:              "test-svc",
+	})
+
+	manager.RegisterCollectionSource(mgr, products, mockSrc,
+		manager.WithCollectionDefaults(func(p product) product {
+			if p.Price == 0 {
+				p.Price = 50
+			}
+			return p
+		}),
+		manager.WithCollectionValidator(func(items []product) error {
+			for _, p := range items {
+				if p.Price == 0 {
+					return errors.New("price must not be zero")
+				}
+			}
+			return nil
+		}),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Defaults run before validator, so Price=0 becomes Price=50,
+	// and the validator passes (no zero prices).
+	all := products.All()
+	if len(all) != 1 {
+		t.Fatalf("Count() = %d, want 1", len(all))
+	}
+	if all[0].Price != 50 {
+		t.Errorf("Price = %d, want 50", all[0].Price)
+	}
+
+	cancel()
+	<-errCh
+}
