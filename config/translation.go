@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -120,6 +121,7 @@ type TranslatedView[T any, R any] struct {
 	source             *Collection[T]
 	transform          func(T) R
 	unsub              func()
+	closeOnce          sync.Once
 	persistence        ViewPersistence
 	persistenceTimeout time.Duration
 	onError            ErrorFunc
@@ -249,10 +251,11 @@ func (tv *TranslatedView[T, R]) Version() Version {
 // the view stops recomputing on source changes. It is safe to call
 // Close multiple times.
 func (tv *TranslatedView[T, R]) Close() {
-	if tv.unsub != nil {
-		tv.unsub()
-		tv.unsub = nil
-	}
+	tv.closeOnce.Do(func() {
+		if tv.unsub != nil {
+			tv.unsub()
+		}
+	})
 }
 
 func (tv *TranslatedView[T, R]) persistCtx() (context.Context, context.CancelFunc) {

@@ -58,6 +58,7 @@ type IndexedView[T any, K comparable] struct {
 	onError            ErrorFunc
 	persistSem         chan struct{}
 	unsub              func()
+	closeOnce          sync.Once
 
 	data atomic.Pointer[indexSnapshot[K, T]]
 
@@ -111,10 +112,11 @@ func (v *IndexedView[T, K]) Name() string {
 // the view stops recomputing on source changes. It is safe to call
 // Close multiple times.
 func (v *IndexedView[T, K]) Close() {
-	if v.unsub != nil {
-		v.unsub()
-		v.unsub = nil
-	}
+	v.closeOnce.Do(func() {
+		if v.unsub != nil {
+			v.unsub()
+		}
+	})
 }
 
 // Get returns all items for the given key, or nil if the key doesn't exist.
@@ -345,6 +347,7 @@ type IndexedViewT[T any, K comparable, V any] struct {
 	onError            ErrorFunc
 	persistSem         chan struct{}
 	unsub              func()
+	closeOnce          sync.Once
 
 	data atomic.Pointer[indexSnapshotT[K, V]]
 }
@@ -394,10 +397,11 @@ func (v *IndexedViewT[T, K, V]) Name() string {
 // the view stops recomputing on source changes. It is safe to call
 // Close multiple times.
 func (v *IndexedViewT[T, K, V]) Close() {
-	if v.unsub != nil {
-		v.unsub()
-		v.unsub = nil
-	}
+	v.closeOnce.Do(func() {
+		if v.unsub != nil {
+			v.unsub()
+		}
+	})
 }
 
 // Get returns the values for the given key. O(1) lookup + slice copy.
