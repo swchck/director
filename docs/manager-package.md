@@ -236,6 +236,35 @@ type registrable interface {
 
 `RegisterCollection[T]` wraps `config.Collection[T]` + `source.CollectionSource[T]` into a `collectionReg[T]` that satisfies `registrable`. Same pattern for singletons. The generic type parameter is captured at registration time and erased from the Manager's perspective.
 
+## Manual Sync Mode
+
+Set `Options.ManualSyncOnly = true` to disable automatic polling and WebSocket-triggered syncs. The manager only syncs from the data source when `SyncNow` is called explicitly.
+
+```go
+mgr := manager.New(store, notifier, reg, manager.Options{
+    ServiceName:    "my-service",
+    ManualSyncOnly: true,
+})
+
+// Wire to an HTTP endpoint:
+http.HandleFunc("/config/sync", func(w http.ResponseWriter, r *http.Request) {
+    mgr.SyncNow(r.Context())
+    w.WriteHeader(http.StatusOK)
+})
+```
+
+What stays active in manual mode:
+- Startup sequence: cache → storage loading (fast init with existing data)
+- Heartbeats and instance registry
+- Notification listener (followers still receive sync events from leader)
+- Follower self-heal (catch up to manually triggered leader syncs)
+- Maintenance (snapshot/instance GC)
+
+What is disabled:
+- Poll ticker (no automatic version checks)
+- WebSocket subscription (no real-time change detection)
+- Initial sync on startup (uses cache/storage only until first `SyncNow`)
+
 ## Force Sync
 
 ```go
@@ -262,6 +291,7 @@ On shutdown, the manager deregisters from the instance registry.
 | `WSPollInterval` | 15m | Poll interval when WebSocket is active |
 | `WSDebounce` | 2s | Debounce window for WS events |
 | `ServiceName` | (required) | Groups replicas in the instance registry |
+| `ManualSyncOnly` | false | Disable auto polling/WS; sync only via `SyncNow` |
 
 ## Manager Options (functional)
 

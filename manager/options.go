@@ -105,6 +105,17 @@ type Options struct {
 	//
 	// Default: 1 hour. Has no effect if both retentions are 0.
 	MaintenanceInterval time.Duration
+
+	// ManualSyncOnly disables automatic polling and WebSocket-triggered syncs.
+	// When true, the manager only syncs from the data source when SyncNow is
+	// called explicitly (e.g. from an HTTP handler like /config/sync).
+	//
+	// The startup sequence still loads from cache and storage for fast init.
+	// Heartbeats, notifications (follower protocol), maintenance, and follower
+	// self-heal continue to run normally.
+	//
+	// Default: false (automatic polling).
+	ManualSyncOnly bool
 }
 
 func (o Options) withDefaults() Options {

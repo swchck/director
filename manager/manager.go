@@ -184,8 +184,11 @@ func (m *Manager) Start(ctx context.Context) error {
 	// 3. Load from storage (active snapshots).
 	m.loadFromStorage(ctx)
 
-	// 4. Initial sync.
-	m.syncAll(ctx)
+	// 4. Initial sync (skipped in manual mode — data comes from cache/storage
+	// until SyncNow is called explicitly).
+	if !m.opts.ManualSyncOnly {
+		m.syncAll(ctx)
+	}
 
 	// 5. Subscribe to notifications.
 	events, err := m.notifier.Subscribe(ctx)
@@ -193,9 +196,9 @@ func (m *Manager) Start(ctx context.Context) error {
 		return fmt.Errorf("manager: subscribe: %w", err)
 	}
 
-	// 5b. Subscribe to Directus WebSocket (optional).
+	// 5b. Subscribe to Directus WebSocket (optional, skipped in manual mode).
 	var wsEvents <-chan directus.ChangeEvent
-	if m.ws != nil {
+	if m.ws != nil && !m.opts.ManualSyncOnly {
 		collections := m.collectionNames()
 		var wsErr error
 		wsEvents, wsErr = m.ws.Subscribe(ctx, collections...)
@@ -212,6 +215,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		dlog.String("service", m.opts.ServiceName),
 		dlog.Int("configs", len(m.configs)),
 		dlog.Bool("websocket", wsEvents != nil),
+		dlog.Bool("manual_sync", m.opts.ManualSyncOnly),
 	)
 
 	// 6. Run event loops.
@@ -250,11 +254,15 @@ func (m *Manager) SyncNow(ctx context.Context) {
 // run is the main event loop: polls the source, sends heartbeats, handles
 // notifications and optionally WebSocket change events with debouncing.
 func (m *Manager) run(ctx context.Context, events <-chan notify.Event, wsEvents <-chan directus.ChangeEvent) error {
+	// Poll ticker: in manual mode, create a stopped ticker so the select case
+	// never fires but the variable is still valid for WS fallback reset.
 	pollTicker := time.NewTicker(m.opts.PollInterval)
 	defer pollTicker.Stop()
 
-	// When WebSocket is active, use a longer poll interval as safety net.
-	if wsEvents != nil {
+	if m.opts.ManualSyncOnly {
+		pollTicker.Stop() // never fires
+	} else if wsEvents != nil {
+		// When WebSocket is active, use a longer poll interval as safety net.
 		pollTicker.Reset(m.opts.WSPollInterval)
 	}
 
@@ -293,17 +301,25 @@ func (m *Manager) run(ctx context.Context, events <-chan notify.Event, wsEvents 
 			if err := m.registry.Heartbeat(ctx, m.instanceID); err != nil {
 				m.logger.Error("manager: heartbeat failed", dlog.Err(err))
 			}
-			// Attempt leader election on every heartbeat. This reduces the
-			// leadership vacuum from PollInterval (5m) to HeartbeatInterval
-			// (10s) during rolling deployments. The overhead is one
-			// pg_try_advisory_lock call per pod per heartbeat (trivial).
-			// If the lock is acquired, syncAll runs version checks and
-			// skips the full fetch when versions match.
-			if wasLeader := m.syncAll(ctx); !wasLeader {
-				// Follower self-heal: compare local version with active
-				// snapshot. If behind (e.g. missed a notification due to
-				// connection drop or buffer overflow), fetch and apply.
+
+			// In manual mode, skip automatic sync — only SyncNow triggers it.
+			// Follower self-heal still runs so followers catch up to manually
+			// triggered leader syncs.
+			if m.opts.ManualSyncOnly {
 				m.followerCatchUp(ctx)
+			} else {
+				// Attempt leader election on every heartbeat. This reduces the
+				// leadership vacuum from PollInterval (5m) to HeartbeatInterval
+				// (10s) during rolling deployments. The overhead is one
+				// pg_try_advisory_lock call per pod per heartbeat (trivial).
+				// If the lock is acquired, syncAll runs version checks and
+				// skips the full fetch when versions match.
+				if wasLeader := m.syncAll(ctx); !wasLeader {
+					// Follower self-heal: compare local version with active
+					// snapshot. If behind (e.g. missed a notification due to
+					// connection drop or buffer overflow), fetch and apply.
+					m.followerCatchUp(ctx)
+				}
 			}
 
 		case <-maintenanceCh:
