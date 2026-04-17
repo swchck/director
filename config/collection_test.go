@@ -306,3 +306,39 @@ func TestCollection_Filter_NoArgs_ReturnsSafeCopy(t *testing.T) {
 		t.Errorf("mutation via Filter() leaked into snapshot: Name = %q, want 'Original'", all[0].Name)
 	}
 }
+
+func TestCollection_OnChange_HookCannotMutateSnapshot(t *testing.T) {
+	c := config.NewCollection[item]("items")
+
+	c.OnChange(func(_, newItems []item) {
+		// Try to corrupt the snapshot via the hook argument.
+		if len(newItems) > 0 {
+			newItems[0].Name = "CORRUPTED"
+		}
+	})
+
+	_ = c.Swap(v1(), []item{{ID: 1, Name: "Original"}})
+
+	all := c.All()
+	if all[0].Name != "Original" {
+		t.Errorf("hook mutated snapshot: Name = %q, want 'Original'", all[0].Name)
+	}
+}
+
+func TestSingleton_OnChange_HookCannotMutateSnapshot(t *testing.T) {
+	s := config.NewSingleton[item]("settings")
+
+	s.OnChange(func(_, newVal *item) {
+		newVal.Name = "CORRUPTED"
+	})
+
+	_ = s.Swap(v1(), item{ID: 1, Name: "Original"})
+
+	val, ok := s.Get()
+	if !ok {
+		t.Fatal("Get() returned false")
+	}
+	if val.Name != "Original" {
+		t.Errorf("hook mutated snapshot: Name = %q, want 'Original'", val.Name)
+	}
+}

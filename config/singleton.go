@@ -88,6 +88,14 @@ func (s *Singleton[T]) Swap(version Version, value T) error {
 	hooks := s.hooks
 	s.mu.RUnlock()
 
+	// Defensive copies so hooks cannot mutate the internal snapshots.
+	var oldPtr *T
+	if old.value != nil {
+		oldCopy := *old.value
+		oldPtr = &oldCopy
+	}
+	newCopy := v
+
 	wrappers := make([]func(), 0, len(hooks))
 	for _, fn := range hooks {
 		if fn == nil {
@@ -95,7 +103,7 @@ func (s *Singleton[T]) Swap(version Version, value T) error {
 		}
 
 		fn := fn
-		wrappers = append(wrappers, func() { fn(old.value, &v) })
+		wrappers = append(wrappers, func() { fn(oldPtr, &newCopy) })
 	}
 
 	return safeCallHooks(wrappers...)

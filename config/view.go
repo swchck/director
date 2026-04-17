@@ -258,6 +258,12 @@ func (v *View[T]) recompute(sourceItems []T, version Version) {
 	hooks := v.hooks
 	v.mu.RUnlock()
 
+	// Defensive copies so hooks cannot mutate the internal snapshots.
+	oldCopy := make([]T, len(old.items))
+	copy(oldCopy, old.items)
+	newCopy := make([]T, len(stored))
+	copy(newCopy, stored)
+
 	wrappers := make([]func(), 0, len(hooks))
 	for _, fn := range hooks {
 		if fn == nil {
@@ -265,7 +271,7 @@ func (v *View[T]) recompute(sourceItems []T, version Version) {
 		}
 
 		fn := fn
-		wrappers = append(wrappers, func() { fn(old.items, stored) })
+		wrappers = append(wrappers, func() { fn(oldCopy, newCopy) })
 	}
 
 	if err := safeCallHooks(wrappers...); err != nil {
