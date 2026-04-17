@@ -142,6 +142,18 @@ func (m *Manager) collectionNames() []string {
 	return names
 }
 
+// hasEmptyConfigs returns true if any registered config has no data loaded
+// (version is zero). Used to detect first-deploy bootstrap in manual mode.
+func (m *Manager) hasEmptyConfigs() bool {
+	for _, reg := range m.configs {
+		if reg.version().IsZero() {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Start begins the config sync lifecycle. It blocks until ctx is cancelled
 // or Stop is called.
 //
@@ -184,9 +196,14 @@ func (m *Manager) Start(ctx context.Context) error {
 	// 3. Load from storage (active snapshots).
 	m.loadFromStorage(ctx)
 
-	// 4. Initial sync (skipped in manual mode — data comes from cache/storage
-	// until SyncNow is called explicitly).
+	// 4. Initial sync.
 	if !m.opts.ManualSyncOnly {
+		m.syncAll(ctx)
+	} else if m.hasEmptyConfigs() {
+		// Manual mode bootstrap: if cache and storage had no data for some
+		// collections (first deploy), sync once from the source so the
+		// service starts with a valid config. Subsequent updates are manual.
+		m.logger.Info("manager: manual mode bootstrap — empty collections detected, running initial sync")
 		m.syncAll(ctx)
 	}
 

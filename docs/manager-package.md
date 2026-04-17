@@ -255,6 +255,7 @@ http.HandleFunc("/config/sync", func(w http.ResponseWriter, r *http.Request) {
 
 What stays active in manual mode:
 - Startup sequence: cache → storage loading (fast init with existing data)
+- **Bootstrap sync**: if cache and storage are empty (first deploy), one initial sync runs automatically so the service starts with valid config
 - Heartbeats and instance registry
 - Notification listener (followers still receive sync events from leader)
 - Follower self-heal (catch up to manually triggered leader syncs)
@@ -263,7 +264,7 @@ What stays active in manual mode:
 What is disabled:
 - Poll ticker (no automatic version checks)
 - WebSocket subscription (no real-time change detection)
-- Initial sync on startup (uses cache/storage only until first `SyncNow`)
+- Automatic sync on startup when data already exists in cache/storage
 
 ## Force Sync
 
