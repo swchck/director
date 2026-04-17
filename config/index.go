@@ -232,9 +232,19 @@ func (v *IndexedView[T, K]) recompute(items []T, version Version) {
 	hooks := v.hooks
 	v.mu.RUnlock()
 
+	wrappers := make([]func(), 0, len(hooks))
 	for _, fn := range hooks {
-		if fn != nil {
-			fn(old.index, index)
+		if fn == nil {
+			continue
+		}
+
+		fn := fn
+		wrappers = append(wrappers, func() { fn(old.index, index) })
+	}
+
+	if err := safeCallHooks(wrappers...); err != nil {
+		if v.onError != nil {
+			v.onError(v.name, err)
 		}
 	}
 }

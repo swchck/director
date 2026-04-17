@@ -581,3 +581,44 @@ func TestIndexedViewT_Close_StopsRecomputing(t *testing.T) {
 		t.Errorf("Count() after Close = %d, want 1 (should not recompute)", byName.Count())
 	}
 }
+
+func TestIndexedView_OnChange_PanicRecovery(t *testing.T) {
+	c := config.NewCollection[articleWithTag]("articles")
+	_ = c.Swap(v1(), []articleWithTag{{ID: 1, Category: "food"}})
+
+	var errReported error
+	byCategory := config.NewIndexedView("by-cat", c,
+		func(b articleWithTag) string { return b.Category },
+		config.WithIndexErrorHandler[articleWithTag, string](func(_ string, err error) {
+			errReported = err
+		}),
+	)
+
+	// Register a panicking hook followed by a normal hook.
+	var secondHookCalled bool
+	byCategory.OnChange(func(_, _ map[string][]articleWithTag) {
+		panic("boom")
+	})
+	byCategory.OnChange(func(_, _ map[string][]articleWithTag) {
+		secondHookCalled = true
+	})
+
+	// Swap triggers recompute → hooks should recover the panic.
+	_ = c.Swap(v2(), []articleWithTag{{ID: 2, Category: "drinks"}})
+
+	if !secondHookCalled {
+		t.Error("second hook was not called after first hook panicked")
+	}
+
+	if errReported == nil {
+		t.Error("expected error to be reported via onError")
+	}
+
+	// Verify the view still has correct data despite the panic.
+	if byCategory.Count() != 1 {
+		t.Errorf("Count() = %d, want 1", byCategory.Count())
+	}
+	if !byCategory.Has("drinks") {
+		t.Error("expected drinks category after swap")
+	}
+}
