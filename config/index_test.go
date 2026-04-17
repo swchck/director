@@ -528,3 +528,56 @@ func TestIndexedView_OnChange(t *testing.T) {
 		t.Error("OnChange hook not called")
 	}
 }
+
+func TestIndexedView_Close_StopsRecomputing(t *testing.T) {
+	c := config.NewCollection[articleWithTag]("articles")
+	_ = c.Swap(v1(), []articleWithTag{
+		{ID: 1, Category: "tech"},
+	})
+
+	byCategory := config.NewIndexedView("by-category", c,
+		func(a articleWithTag) string { return a.Category },
+	)
+
+	if byCategory.Count() != 1 {
+		t.Fatalf("initial Count() = %d, want 1", byCategory.Count())
+	}
+
+	byCategory.Close()
+
+	_ = c.Swap(v2(), []articleWithTag{
+		{ID: 1, Category: "tech"},
+		{ID: 2, Category: "food"},
+	})
+
+	if byCategory.Count() != 1 {
+		t.Errorf("Count() after Close = %d, want 1 (should not recompute)", byCategory.Count())
+	}
+}
+
+func TestIndexedViewT_Close_StopsRecomputing(t *testing.T) {
+	c := config.NewCollection[articleWithTag]("articles")
+	_ = c.Swap(v1(), []articleWithTag{
+		{ID: 1, Name: "Pizza", Tags: []tag{{ID: 10, Priority: 100}}},
+	})
+
+	byName := config.NewIndexedViewT("tags-by-name", c,
+		func(a articleWithTag) string { return a.Name },
+		func(a articleWithTag) []tag { return a.Tags },
+	)
+
+	if byName.Count() != 1 {
+		t.Fatalf("initial Count() = %d, want 1", byName.Count())
+	}
+
+	byName.Close()
+
+	_ = c.Swap(v2(), []articleWithTag{
+		{ID: 1, Name: "Pizza", Tags: []tag{{ID: 10, Priority: 100}}},
+		{ID: 2, Name: "Salad", Tags: []tag{{ID: 20, Priority: 200}}},
+	})
+
+	if byName.Count() != 1 {
+		t.Errorf("Count() after Close = %d, want 1 (should not recompute)", byName.Count())
+	}
+}

@@ -39,9 +39,10 @@ type Manager struct {
 	instanceID string
 	opts       Options
 
-	mu      sync.Mutex
-	cancel  context.CancelFunc
-	started atomic.Bool
+	mu             sync.Mutex
+	cancel         context.CancelFunc
+	started        atomic.Bool
+	deregisterOnce sync.Once
 }
 
 // New creates a new Manager.
@@ -171,11 +172,11 @@ func (m *Manager) Start(ctx context.Context) error {
 		return fmt.Errorf("manager: register instance: %w", err)
 	}
 
-	defer func() {
+	defer m.deregisterOnce.Do(func() {
 		if err := m.registry.Deregister(context.Background(), m.instanceID); err != nil {
 			m.logger.Error("manager: deregister instance", dlog.Err(err))
 		}
-	}()
+	})
 
 	// 2. Load from cache for fast startup.
 	m.loadFromCache(ctx)
@@ -218,7 +219,21 @@ func (m *Manager) Start(ctx context.Context) error {
 }
 
 // Stop signals the manager to shut down gracefully.
+//
+// It deregisters the instance from the registry before stopping the event
+// loop. This removes the instance from AliveInstances immediately, preventing
+// phantom instances in 2PC target sets during rolling deployments.
 func (m *Manager) Stop() {
+	// Deregister first so the instance disappears from AliveInstances
+	// before the event loop stops. This is critical for 2PC mode:
+	// without it, the dying instance stays in the target set for up to
+	// staleThreshold (30s), causing prepare timeouts and aborted rounds.
+	m.deregisterOnce.Do(func() {
+		if err := m.registry.Deregister(context.Background(), m.instanceID); err != nil {
+			m.logger.Error("manager: deregister on stop", dlog.Err(err))
+		}
+	})
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -278,6 +293,13 @@ func (m *Manager) run(ctx context.Context, events <-chan notify.Event, wsEvents 
 			if err := m.registry.Heartbeat(ctx, m.instanceID); err != nil {
 				m.logger.Error("manager: heartbeat failed", dlog.Err(err))
 			}
+			// Attempt leader election on every heartbeat. This reduces the
+			// leadership vacuum from PollInterval (5m) to HeartbeatInterval
+			// (10s) during rolling deployments. The overhead is one
+			// pg_try_advisory_lock call per pod per heartbeat (trivial).
+			// If the lock is acquired, syncAll runs version checks and
+			// skips the full fetch when versions match.
+			m.syncAll(ctx)
 
 		case <-maintenanceCh:
 			m.runMaintenance(ctx)

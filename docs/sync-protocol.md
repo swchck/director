@@ -1,11 +1,11 @@
 # Sync Protocol
 
-This document explains how config changes propagate from Directus to all application replicas.
+This document explains how config changes propagate from the data source to all application replicas.
 
 ## Participants
 
-- **Directus** — the source of truth for all config data
-- **Leader** — the replica that holds the Postgres advisory lock; performs fetches from Directus
+- **Data Source** — the source of truth for all config data (e.g. Directus, custom API)
+- **Leader** — the replica that holds the Postgres advisory lock; performs fetches from the source
 - **Followers** — all other replicas; receive data via storage snapshots
 - **Postgres** — stores snapshots, apply logs, advisory locks, and instance registry
 - **Notify channel** — delivers sync/rollback events (Postgres LISTEN/NOTIFY or Redis Pub/Sub)
@@ -117,58 +117,33 @@ This means replicas can serve requests immediately after step 2 or 3, before Dir
 
 ## Sequence Diagram
 
-```
-        Leader              Postgres            Follower A          Follower B
-          │                    │                    │                    │
-          │ pg_try_advisory_lock                    │                    │
-          │───────────────────►│                    │                    │
-          │ ◄── true           │                    │                    │
-          │                    │                    │                    │
-          │ GET /items/biz?sort=-date_updated&limit=1  (to Directus)    │
-          │ ◄── date_updated changed                │                    │
-          │                    │                    │                    │
-          │ GET /items/biz     (full fetch from Directus)               │
-          │ ◄── [{id:1,...}]   │                    │                    │
-          │                    │                    │                    │
-          │ Config.Swap()      │                    │                    │
-          │ (local apply)      │                    │                    │
-          │                    │                    │                    │
-          │ INSERT snapshot    │                    │                    │
-          │───────────────────►│                    │                    │
-          │                    │                    │                    │
-          │ INSERT apply_log   │                    │                    │
-          │───────────────────►│                    │                    │
-          │                    │                    │                    │
-          │ pg_notify(sync)    │                    │                    │
-          │───────────────────►│                    │                    │
-          │                    │ ──notification────►│                    │
-          │                    │ ──notification────────────────────────►│
-          │                    │                    │                    │
-          │                    │    SELECT snapshot │                    │
-          │                    │◄───────────────────│                    │
-          │                    │───content─────────►│                    │
-          │                    │                    │ Config.Swap()      │
-          │                    │                    │                    │
-          │                    │                    │ INSERT apply_log   │
-          │                    │◄───────────────────│                    │
-          │                    │                    │                    │
-          │                    │            SELECT snapshot              │
-          │                    │◄───────────────────────────────────────│
-          │                    │───content──────────────────────────────►│
-          │                    │                    │                    │ Config.Swap()
-          │                    │                    │                    │
-          │                    │                    │     INSERT apply_log
-          │                    │◄───────────────────────────────────────│
-          │                    │                    │                    │
-          │ COUNT(applied) >= COUNT(alive)          │                    │
-          │───────────────────►│                    │                    │
-          │ ◄── confirmed      │                    │                    │
-          │                    │                    │                    │
-          │ UPDATE status=active                    │                    │
-          │───────────────────►│                    │                    │
-          │                    │                    │                    │
-          │ pg_advisory_unlock │                    │                    │
-          │───────────────────►│                    │                    │
+```mermaid
+sequenceDiagram
+    participant L as Leader
+    participant PG as Postgres
+    participant FA as Follower A
+    participant FB as Follower B
+
+    L->>PG: pg_try_advisory_lock → true
+    L->>L: fetch version from source
+    L->>L: fetch items from source
+    L->>L: Config.Swap() (local apply)
+    L->>PG: INSERT snapshot
+    L->>PG: INSERT apply_log (applied)
+    L->>PG: pg_notify(sync)
+    PG-->>FA: notification
+    PG-->>FB: notification
+    FA->>PG: SELECT snapshot
+    PG-->>FA: content
+    FA->>FA: Config.Swap()
+    FA->>PG: INSERT apply_log (applied)
+    FB->>PG: SELECT snapshot
+    PG-->>FB: content
+    FB->>FB: Config.Swap()
+    FB->>PG: INSERT apply_log (applied)
+    L->>PG: COUNT(applied) >= COUNT(alive) → confirmed
+    L->>PG: UPDATE status=active
+    L->>PG: pg_advisory_unlock
 ```
 
 ## Rollback
@@ -318,45 +293,46 @@ manager.Options{
 
 ### Sequence diagram (2PC, happy path)
 
+```mermaid
+sequenceDiagram
+    participant L as Leader
+    participant PG as Postgres
+    participant FA as Follower A
+    participant FB as Follower B
+
+    L->>L: fetch + stage(roundID)
+    L->>PG: SaveSnapshot (pending)
+    L->>PG: AliveInstances → [leader, A, B]
+    L->>PG: LogApply(self, prepared)
+    L->>PG: notify(prepare, roundID)
+    PG-->>FA: prepare
+    PG-->>FB: prepare
+    FA->>PG: GetSnapshot → stageFromBytes
+    FA->>PG: LogApply(A, prepared)
+    FB->>PG: GetSnapshot → stageFromBytes
+    FB->>PG: LogApply(B, prepared)
+    loop every 500ms
+        L->>PG: AppliedInstances(prepared)
+    end
+    PG-->>L: [leader, A, B] — all prepared
+    L->>PG: notify(commit, roundID)
+    PG-->>FA: commit
+    PG-->>FB: commit
+    L->>L: commitStaged (Swap)
+    FA->>FA: commitStaged (Swap)
+    FB->>FB: commitStaged (Swap)
+    L->>PG: ActivateSnapshot
 ```
-        Leader                 Postgres              Follower A            Follower B
-          │                       │                      │                      │
-          │ fetch + stage(roundID)                       │                      │
-          │                       │                      │                      │
-          │ SaveSnapshot pending  │                      │                      │
-          │──────────────────────►│                      │                      │
-          │                       │                      │                      │
-          │ AliveInstances        │                      │                      │
-          │──────────────────────►│                      │                      │
-          │ ◄── [leader, A, B]    │                      │                      │
-          │                       │                      │                      │
-          │ LogApply(self, prepared)                     │                      │
-          │──────────────────────►│                      │                      │
-          │                       │                      │                      │
-          │ notify(prepare, roundID)                     │                      │
-          │──────────────────────►│ ───────────────────► │ ────────────────────►│
-          │                       │                      │                      │
-          │                       │  GetSnapshot         │                      │
-          │                       │◄─── stageFromBytes ──│                      │
-          │                       │  LogApply(A, prepared)                      │
-          │                       │◄─────────────────────│                      │
-          │                       │                 GetSnapshot                 │
-          │                       │◄────────────────────────────────────────────│
-          │                       │                     stageFromBytes          │
-          │                       │            LogApply(B, prepared)            │
-          │                       │◄────────────────────────────────────────────│
-          │                       │                      │                      │
-          │ AppliedInstances(prepared) every 500ms       │                      │
-          │──────────────────────►│                      │                      │
-          │ ◄── [leader, A, B]    │                      │                      │
-          │                       │                      │                      │
-          │ notify(commit, roundID)                      │                      │
-          │──────────────────────►│ ───────────────────► │ ────────────────────►│
-          │ commitStaged (Swap)   │                      │ commitStaged (Swap)  │ commitStaged (Swap)
-          │                       │                      │                      │
-          │ ActivateSnapshot      │                      │                      │
-          │──────────────────────►│                      │                      │
-```
+
+### Rolling Deployments
+
+2PC is sensitive to instance churn. During a rolling update, dying pods remain in `AliveInstances` until their heartbeat goes stale (`staleThreshold`, default 30s). The leader includes them in the prepare target set, they don't respond, and the round aborts on timeout.
+
+With 15 pods and `MaxUnavailable=1`, this can block all config updates for the duration of the rollout.
+
+**Mitigation:** call `manager.Stop()` on `SIGTERM`. Stop deregisters the instance from the registry **before** stopping the event loop, removing it from `AliveInstances` immediately. This reduces the phantom window from 30s to effectively zero.
+
+See [rolling-deployment.md](./rolling-deployment.md) for full guidance.
 
 ### Observability
 

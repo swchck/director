@@ -69,3 +69,60 @@ func TestReadableCollection_HidesSwap(t *testing.T) {
 		t.Errorf("Find Widget = %v, %v", found, ok)
 	}
 }
+
+func TestReadableCollection_ViewCompliance(t *testing.T) {
+	c := config.NewCollection[item]("items")
+	_ = c.Swap(v1(), []item{{ID: 1, Category: "a"}})
+
+	view := config.NewView("a-items", c, nil)
+
+	var rc config.ReadableCollection[item] = view
+
+	if rc.Name() != "a-items" {
+		t.Errorf("Name() = %q, want 'a-items'", rc.Name())
+	}
+	if rc.Count() != 1 {
+		t.Errorf("Count() = %d, want 1", rc.Count())
+	}
+}
+
+func TestReadableCollection_TranslatedViewCompliance(t *testing.T) {
+	type product struct {
+		ID   int
+		Name string
+	}
+	type localized struct {
+		ID   int
+		Name string
+	}
+
+	c := config.NewCollection[product]("products")
+	_ = c.Swap(v1(), []product{{ID: 1, Name: "Apple"}})
+
+	tv := config.NewTranslatedView("products-loc", c, func(p product) localized {
+		return localized(p)
+	})
+
+	var rc config.ReadableCollection[localized] = tv
+
+	if rc.Count() != 1 {
+		t.Errorf("Count() = %d, want 1", rc.Count())
+	}
+}
+
+func TestReadableCollection_RelatedViewCompliance(t *testing.T) {
+	c := config.NewCollection[articleWithTags]("articles")
+	_ = c.Swap(v1(), []articleWithTags{
+		{ID: 1, Tags: []tag{{ID: 10, Priority: 100}}},
+	})
+
+	rv := config.NewRelatedView("tags", c,
+		func(a articleWithTags) []tag { return a.Tags },
+	)
+
+	var rc config.ReadableCollection[tag] = rv
+
+	if rc.Count() != 1 {
+		t.Errorf("Count() = %d, want 1", rc.Count())
+	}
+}

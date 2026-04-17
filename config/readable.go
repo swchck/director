@@ -28,4 +28,7 @@ type ReadableSingleton[T any] interface {
 
 // Compile-time interface compliance checks.
 var _ ReadableCollection[int] = (*Collection[int])(nil)
+var _ ReadableCollection[int] = (*View[int])(nil)
+var _ ReadableCollection[int] = (*RelatedView[int, int])(nil)
+var _ ReadableCollection[int] = (*TranslatedView[int, int])(nil)
 var _ ReadableSingleton[int] = (*Singleton[int])(nil)
