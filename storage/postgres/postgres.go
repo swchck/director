@@ -16,6 +16,8 @@ import (
 //go:embed migrations/001_init.sql
 var MigrationSQL string
 
+var _ storage.ActiveVersionChecker = (*Storage)(nil)
+
 // Storage implements storage.Storage using PostgreSQL.
 type Storage struct {
 	pool *pgxpool.Pool
@@ -109,6 +111,28 @@ func (s *Storage) GetActiveSnapshot(ctx context.Context, collection string) (*st
 	}
 
 	return snap, nil
+}
+
+// GetActiveVersion returns just the version string of the active snapshot,
+// without fetching the full content. Used by followers for cheap version
+// comparison during self-heal checks.
+func (s *Storage) GetActiveVersion(ctx context.Context, collection string) (string, error) {
+	const query = `
+		SELECT version
+		FROM director.config_snapshots
+		WHERE collection_name = $1 AND status = $2`
+
+	var version string
+	err := s.pool.QueryRow(ctx, query, collection, storage.StatusActive).Scan(&version)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("storage/postgres: active version %s: %w", collection, storage.ErrSnapshotNotFound)
+		}
+
+		return "", fmt.Errorf("storage/postgres: active version %s: %w", collection, err)
+	}
+
+	return version, nil
 }
 
 // GetSnapshot returns a specific snapshot by collection and version.
