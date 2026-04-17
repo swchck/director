@@ -110,11 +110,13 @@ func (c *Channel) Subscribe(ctx context.Context) (<-chan notify.Event, error) {
 		c.mu.Unlock()
 		return nil, notify.ErrClosed
 	}
-	c.mu.Unlock()
+
+	// Cancel any previous subscription to prevent goroutine/connection leaks.
+	if c.cancel != nil {
+		c.cancel()
+	}
 
 	listenCtx, cancel := context.WithCancel(ctx)
-
-	c.mu.Lock()
 	c.cancel = cancel
 	c.mu.Unlock()
 
