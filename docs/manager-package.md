@@ -93,6 +93,39 @@ Trade-off: a chronically broken replica blocks config updates for the entire clu
 
 See [sync-protocol.md](./sync-protocol.md#two-phase-commit-mode-strict-consistency) for the full protocol and operational notes.
 
+## Default Values
+
+Apply default values to fields that arrive as zero values from the data source:
+
+```go
+manager.RegisterCollectionSource(mgr, products, productSource,
+    manager.WithCollectionDefaults(func(p Product) Product {
+        if p.Currency == "" {
+            p.Currency = "USD"
+        }
+        if p.MaxStock == 0 {
+            p.MaxStock = 100
+        }
+        return p
+    }),
+)
+
+manager.RegisterSingletonSource(mgr, settings, settingsSource,
+    manager.WithSingletonDefaults(func(s Settings) Settings {
+        if s.Locale == "" {
+            s.Locale = "en-US"
+        }
+        return s
+    }),
+)
+```
+
+Behavior:
+
+- Defaults run after fetch/deserialize and **before** validation. The validator sees data with defaults already applied.
+- Applied on every path: leader fetch, follower snapshot load, 2PC prepare/stage.
+- The function receives each item by value and returns the modified copy.
+
 ## Pre-Apply Validation
 
 Attach a validator at registration time to reject upstream data before it is swapped into memory:
@@ -308,5 +341,7 @@ On shutdown, the manager deregisters from the instance registry.
 
 | Option | Description |
 |---|---|
+| `WithCollectionDefaults(fn)` | Per-item defaults for `RegisterCollectionSource` (see [Default Values](#default-values)) |
+| `WithSingletonDefaults(fn)` | Defaults for `RegisterSingletonSource` |
 | `WithCollectionValidator(fn)` | Pre-apply validator for `RegisterCollectionSource` (see [Pre-Apply Validation](#pre-apply-validation)) |
 | `WithSingletonValidator(fn)` | Pre-apply validator for `RegisterSingletonSource` |
