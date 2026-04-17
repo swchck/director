@@ -299,7 +299,12 @@ func (m *Manager) run(ctx context.Context, events <-chan notify.Event, wsEvents 
 			// pg_try_advisory_lock call per pod per heartbeat (trivial).
 			// If the lock is acquired, syncAll runs version checks and
 			// skips the full fetch when versions match.
-			m.syncAll(ctx)
+			if wasLeader := m.syncAll(ctx); !wasLeader {
+				// Follower self-heal: compare local version with active
+				// snapshot. If behind (e.g. missed a notification due to
+				// connection drop or buffer overflow), fetch and apply.
+				m.followerCatchUp(ctx)
+			}
 
 		case <-maintenanceCh:
 			m.runMaintenance(ctx)

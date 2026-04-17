@@ -81,3 +81,17 @@ type Storage interface {
 	// Returns the number of snapshots deleted.
 	DeleteOldSnapshots(ctx context.Context, olderThan time.Time) (int, error)
 }
+
+// ActiveVersionChecker is an optional interface that storage implementations
+// may satisfy to allow cheap version-only queries. When available, followers
+// use this to compare their local version with the active snapshot without
+// fetching the full content.
+//
+// Implementations that do not support this are still fully functional —
+// the manager falls back to GetActiveSnapshot.
+type ActiveVersionChecker interface {
+	// GetActiveVersion returns the version string of the currently active
+	// snapshot for a collection. Returns ErrSnapshotNotFound if no active
+	// snapshot exists.
+	GetActiveVersion(ctx context.Context, collection string) (string, error)
+}

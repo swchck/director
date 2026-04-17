@@ -21,16 +21,17 @@ var errPrepareFailed = errors.New("manager: prepare phase failed")
 
 // syncAll runs one sync cycle for all registered configs.
 // If this instance holds the advisory lock, it acts as leader; otherwise follower.
-func (m *Manager) syncAll(ctx context.Context) {
+// Returns true if this instance acted as leader.
+func (m *Manager) syncAll(ctx context.Context) bool {
 	release, err := m.storage.AcquireLock(ctx, m.opts.AdvisoryLockKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrLockNotAcquired) {
 			// Another instance is leader — nothing to do, follower reacts to notifications.
-			return
+			return false
 		}
 
 		m.logger.Error("manager: acquire lock failed", dlog.Err(err))
-		return
+		return false
 	}
 	defer release()
 
@@ -46,6 +47,85 @@ func (m *Manager) syncAll(ctx context.Context) {
 			m.logger.Error("manager: leader sync failed", dlog.Err(err), dlog.String("collection", reg.name()))
 		}
 	}
+
+	return true
+}
+
+// followerCatchUp checks each collection's active snapshot version and applies
+// it if the local version is behind. This catches notifications lost due to
+// connection drops, Redis failover, or buffer overflow.
+//
+// The method uses ActiveVersionChecker (if the storage supports it) for a
+// cheap version-only query, falling back to GetActiveSnapshot otherwise.
+func (m *Manager) followerCatchUp(ctx context.Context) {
+	for _, reg := range m.configs {
+		activeVersion, err := m.getActiveVersion(ctx, reg.name())
+		if err != nil {
+			if errors.Is(err, storage.ErrSnapshotNotFound) {
+				continue // no active snapshot yet
+			}
+			m.logger.Error("manager: follower catch-up version check",
+				dlog.Err(err), dlog.String("collection", reg.name()))
+			continue
+		}
+
+		parsedVersion, err := config.ParseVersion(activeVersion)
+		if err != nil {
+			continue
+		}
+
+		if reg.version().Equal(parsedVersion) {
+			continue // already up to date
+		}
+
+		m.logger.Info("manager: follower catch-up detected stale version",
+			dlog.String("collection", reg.name()),
+			dlog.String("local", reg.version().String()),
+			dlog.String("active", activeVersion),
+		)
+
+		snap, err := m.storage.GetActiveSnapshot(ctx, reg.name())
+		if err != nil {
+			m.logger.Error("manager: follower catch-up get snapshot",
+				dlog.Err(err), dlog.String("collection", reg.name()))
+			continue
+		}
+
+		version, err := config.ParseVersion(snap.Version)
+		if err != nil {
+			continue
+		}
+
+		if err := reg.swapFromBytes(version, snap.Content); err != nil {
+			m.logger.Error("manager: follower catch-up swap",
+				dlog.Err(err), dlog.String("collection", reg.name()))
+			continue
+		}
+
+		m.logApplyStatus(ctx, reg.name(), snap.Version, "applied")
+		m.metrics.FollowerApplied(reg.name())
+
+		m.logger.Info("manager: follower catch-up applied",
+			dlog.String("collection", reg.name()),
+			dlog.String("version", snap.Version),
+		)
+	}
+}
+
+// getActiveVersion returns the active snapshot version for a collection.
+// Uses the cheap ActiveVersionChecker interface if the storage supports it,
+// otherwise falls back to GetActiveSnapshot (which loads full content).
+func (m *Manager) getActiveVersion(ctx context.Context, collection string) (string, error) {
+	if vc, ok := m.storage.(storage.ActiveVersionChecker); ok {
+		return vc.GetActiveVersion(ctx, collection)
+	}
+
+	snap, err := m.storage.GetActiveSnapshot(ctx, collection)
+	if err != nil {
+		return "", err
+	}
+
+	return snap.Version, nil
 }
 
 // runMaintenance is invoked by the maintenance ticker. Only the leader
@@ -692,6 +772,19 @@ func (m *Manager) leaderSync2PC(ctx context.Context, reg registrable, force bool
 		dlog.String("version", version),
 		dlog.String("round_id", roundID),
 	)
+
+	// 10. Publish a fallback sync event so followers that missed the commit
+	// notification (e.g. due to a transient connection drop) can still apply
+	// via the eventually-consistent path. The active snapshot is now in
+	// storage, so handleSyncEvent will find it.
+	fallbackEvent := notify.Event{
+		Action:     notify.ActionSync,
+		Collection: collection,
+		Version:    version,
+	}
+	if pubErr := m.notifier.Publish(ctx, fallbackEvent); pubErr != nil {
+		m.logger.Warn("manager: 2PC fallback sync publish failed", dlog.Err(pubErr))
+	}
 
 	return nil
 }
