@@ -799,3 +799,22 @@ func TestView_First_Empty(t *testing.T) {
 		t.Error("First() should return false on empty view")
 	}
 }
+
+func TestView_Close_ConcurrentSafe(t *testing.T) {
+	c := config.NewCollection[item]("items")
+	_ = c.Swap(v1(), []item{{ID: 1, Name: "a"}})
+	view := config.NewView("v", c, nil)
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			view.Close()
+		})
+	}
+	wg.Wait()
+
+	// View should still be readable after close.
+	if view.Count() != 1 {
+		t.Errorf("Count() = %d, want 1", view.Count())
+	}
+}

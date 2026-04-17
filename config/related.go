@@ -47,8 +47,9 @@ type RelatedView[T any, R any] struct {
 	source  *Collection[T]
 	extract func(T) []R
 	dedup   func(R, R) bool // optional: returns true if two items are the same
-	onError ErrorFunc
-	unsub   func()
+	onError   ErrorFunc
+	unsub     func()
+	closeOnce sync.Once
 
 	data atomic.Pointer[relatedSnapshot[R]]
 
@@ -131,10 +132,11 @@ func (v *RelatedView[T, R]) Version() Version {
 // the view stops recomputing on source changes. It is safe to call
 // Close multiple times.
 func (v *RelatedView[T, R]) Close() {
-	if v.unsub != nil {
-		v.unsub()
-		v.unsub = nil
-	}
+	v.closeOnce.Do(func() {
+		if v.unsub != nil {
+			v.unsub()
+		}
+	})
 }
 
 // All returns a copy of all flattened related items.

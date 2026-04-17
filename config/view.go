@@ -60,6 +60,7 @@ type View[T any] struct {
 	onError            ErrorFunc
 	persistSem         chan struct{}
 	unsub              func()
+	closeOnce          sync.Once
 
 	data atomic.Pointer[viewSnapshot[T]]
 
@@ -134,10 +135,11 @@ func (v *View[T]) Version() Version {
 // Close multiple times. Reads remain valid after Close but return
 // stale data.
 func (v *View[T]) Close() {
-	if v.unsub != nil {
-		v.unsub()
-		v.unsub = nil
-	}
+	v.closeOnce.Do(func() {
+		if v.unsub != nil {
+			v.unsub()
+		}
+	})
 }
 
 // All returns a copy of the cached view items.
@@ -337,6 +339,7 @@ type SingletonView[T any, R any] struct {
 	onError            ErrorFunc
 	persistSem         chan struct{}
 	unsub              func()
+	closeOnce          sync.Once
 
 	data atomic.Pointer[singletonViewSnapshot[R]]
 }
@@ -432,10 +435,11 @@ func (v *SingletonView[T, R]) Name() string {
 // the view stops recomputing on source changes. It is safe to call
 // Close multiple times.
 func (v *SingletonView[T, R]) Close() {
-	if v.unsub != nil {
-		v.unsub()
-		v.unsub = nil
-	}
+	v.closeOnce.Do(func() {
+		if v.unsub != nil {
+			v.unsub()
+		}
+	})
 }
 
 func (v *SingletonView[T, R]) recompute(source T, version Version) {
