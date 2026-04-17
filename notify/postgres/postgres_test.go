@@ -4,12 +4,63 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/swchck/director/notify"
 	pgnotify "github.com/swchck/director/notify/postgres"
 )
 
 func TestChannel_ImplementsChannelInterface(t *testing.T) {
 	var _ notify.Channel = (*pgnotify.Channel)(nil)
+}
+
+func TestNewChannel_ValidChannelNames(t *testing.T) {
+	pool := (*pgxpool.Pool)(nil)
+
+	valid := []string{"config_sync", "my_channel", "_private", "A", "a1_2_3"}
+	for _, name := range valid {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("valid channel name %q caused panic: %v", name, r)
+				}
+			}()
+			_ = pgnotify.NewChannel(pool, pgnotify.WithChannel(name))
+		})
+	}
+}
+
+func TestNewChannel_InvalidChannelNames(t *testing.T) {
+	pool := (*pgxpool.Pool)(nil)
+
+	invalid := []string{
+		"",
+		"123abc",
+		"foo bar",
+		"foo;DROP TABLE x",
+		"foo--comment",
+		"foo'bar",
+		"channel.name",
+	}
+	for _, name := range invalid {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("invalid channel name %q did not panic", name)
+				}
+			}()
+			_ = pgnotify.NewChannel(pool, pgnotify.WithChannel(name))
+		})
+	}
+}
+
+func TestNewChannel_DefaultChannelIsValid(t *testing.T) {
+	pool := (*pgxpool.Pool)(nil)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("default channel name caused panic: %v", r)
+		}
+	}()
+	_ = pgnotify.NewChannel(pool)
 }
 
 func TestNextBackoff(t *testing.T) {

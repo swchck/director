@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sync"
 	"time"
 
@@ -13,6 +14,10 @@ import (
 	dlog "github.com/swchck/director/log"
 	"github.com/swchck/director/notify"
 )
+
+// validChannelName matches valid PostgreSQL identifiers used for LISTEN/NOTIFY.
+// The channel name is interpolated into SQL, so we must restrict it to safe characters.
+var validChannelName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 const (
 	defaultChannel             = "config_sync"
@@ -63,6 +68,10 @@ func WithHealthCheckInterval(d time.Duration) Option {
 }
 
 // NewChannel creates a new PostgreSQL notification channel.
+//
+// The channel name (set via WithChannel) must be a valid PostgreSQL identifier:
+// start with a letter or underscore, followed by letters, digits, or underscores.
+// Invalid names cause a panic to prevent SQL injection in the LISTEN statement.
 func NewChannel(pool *pgxpool.Pool, opts ...Option) *Channel {
 	c := &Channel{
 		pool:                pool,
@@ -73,6 +82,10 @@ func NewChannel(pool *pgxpool.Pool, opts ...Option) *Channel {
 
 	for _, opt := range opts {
 		opt(c)
+	}
+
+	if !validChannelName.MatchString(c.channel) {
+		panic(fmt.Sprintf("notify/postgres: invalid channel name %q: must match %s", c.channel, validChannelName.String()))
 	}
 
 	return c
