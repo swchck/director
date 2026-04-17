@@ -818,3 +818,21 @@ func TestView_Close_ConcurrentSafe(t *testing.T) {
 		t.Errorf("Count() = %d, want 1", view.Count())
 	}
 }
+
+func TestView_OnChange_HookCannotMutateSnapshot(t *testing.T) {
+	c := config.NewCollection[item]("items")
+	view := config.NewView("all", c, nil)
+
+	view.OnChange(func(_, newItems []item) {
+		if len(newItems) > 0 {
+			newItems[0].Name = "CORRUPTED"
+		}
+	})
+
+	_ = c.Swap(v1(), []item{{ID: 1, Name: "Original"}})
+
+	all := view.All()
+	if all[0].Name != "Original" {
+		t.Errorf("hook mutated view snapshot: Name = %q, want 'Original'", all[0].Name)
+	}
+}

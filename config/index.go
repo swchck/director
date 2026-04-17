@@ -234,6 +234,10 @@ func (v *IndexedView[T, K]) recompute(items []T, version Version) {
 	hooks := v.hooks
 	v.mu.RUnlock()
 
+	// Defensive copies so hooks cannot mutate the internal snapshots.
+	oldCopy := copyIndex(old.index)
+	newCopy := copyIndex(index)
+
 	wrappers := make([]func(), 0, len(hooks))
 	for _, fn := range hooks {
 		if fn == nil {
@@ -241,7 +245,7 @@ func (v *IndexedView[T, K]) recompute(items []T, version Version) {
 		}
 
 		fn := fn
-		wrappers = append(wrappers, func() { fn(old.index, index) })
+		wrappers = append(wrappers, func() { fn(oldCopy, newCopy) })
 	}
 
 	if err := safeCallHooks(wrappers...); err != nil {
@@ -249,6 +253,17 @@ func (v *IndexedView[T, K]) recompute(items []T, version Version) {
 			v.onError(v.name, err)
 		}
 	}
+}
+
+// copyIndex returns a deep copy of an index map.
+func copyIndex[K comparable, V any](m map[K][]V) map[K][]V {
+	result := make(map[K][]V, len(m))
+	for k, items := range m {
+		copied := make([]V, len(items))
+		copy(copied, items)
+		result[k] = copied
+	}
+	return result
 }
 
 func (v *IndexedView[T, K]) persistCtx() (context.Context, context.CancelFunc) {

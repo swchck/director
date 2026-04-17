@@ -146,6 +146,12 @@ func (c *Collection[T]) Swap(version Version, items []T) error {
 	hooks := c.hooks
 	c.mu.RUnlock()
 
+	// Defensive copies so hooks cannot mutate the internal snapshots.
+	oldCopy := make([]T, len(old.items))
+	copy(oldCopy, old.items)
+	newCopy := make([]T, len(stored))
+	copy(newCopy, stored)
+
 	wrappers := make([]func(), 0, len(hooks))
 	for _, fn := range hooks {
 		if fn == nil {
@@ -153,7 +159,7 @@ func (c *Collection[T]) Swap(version Version, items []T) error {
 		}
 
 		fn := fn
-		wrappers = append(wrappers, func() { fn(old.items, stored) })
+		wrappers = append(wrappers, func() { fn(oldCopy, newCopy) })
 	}
 
 	return safeCallHooks(wrappers...)
