@@ -134,6 +134,7 @@ func (i *Items[T]) MaxDateUpdated(ctx context.Context) (time.Time, error) {
 
 func (i *Items[T]) fetchMaxTimestamp(ctx context.Context, field string) (time.Time, error) {
 	query, err := buildQuery([]QueryOption{
+		WithFilter(Field(field, "_nnull", true)),
 		WithSort("-" + field),
 		WithLimit(1),
 		WithFields(field),
