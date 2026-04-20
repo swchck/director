@@ -233,6 +233,22 @@ func TestItems_MaxDateUpdated(t *testing.T) {
 			t.Errorf("limit = %q, want '1'", q.Get("limit"))
 		}
 
+		// Verify _nnull filter is applied to exclude NULL values.
+		filter := q.Get("filter")
+		if filter == "" {
+			t.Fatal("expected filter param with _nnull")
+		}
+
+		var f map[string]any
+		json.Unmarshal([]byte(filter), &f)
+		duFilter, ok := f["date_updated"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected date_updated filter, got %v", f)
+		}
+		if duFilter["_nnull"] != true {
+			t.Errorf("expected _nnull=true filter, got %v", duFilter)
+		}
+
 		writeJSONData(w, []map[string]any{
 			{"date_updated": now.Format(time.RFC3339)},
 		})
