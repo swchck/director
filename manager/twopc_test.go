@@ -1207,12 +1207,6 @@ func TestTwoPC_UnknownCollectionPrepareACK(t *testing.T) {
 		t.Error("follower did not ACK prepare for unknown collection")
 	}
 
-	// The known collection must be unaffected.
-	if articles.Version().IsZero() {
-		// articles loaded from source during initial sync — should have data.
-		// (single-instance 2PC succeeds immediately)
-	}
-
 	cancel()
 	<-errCh
 }
