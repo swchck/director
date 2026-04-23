@@ -11,10 +11,11 @@ During a rolling deployment with 15 pods and `maxUnavailable=1`:
 3. Meanwhile, the leader pod may be one of the pods being replaced
 4. New pods start and need config data before accepting traffic
 
-Two things can go wrong:
+Three things can go wrong:
 
 - **Leader vacuum**: if the leader dies, no new leader is elected until the next `PollInterval` (default 5m). All followers wait for a notification that never comes.
 - **Phantom instances (2PC)**: a dying pod remains in `AliveInstances` for up to 30s. The leader includes it in the prepare target set, it never responds, and the round aborts on timeout.
+- **New collection deadlock (2PC)**: when a rolling deploy adds a new collection, old pods don't have it registered. The leader's 2PC prepare for the new collection is silently ignored by old pods, causing a 30s timeout and abort. Since the new pod's readiness probe requires all collections to be loaded, the pod never becomes ready, blocking the rolling deploy.
 
 ## Solution
 
@@ -42,6 +43,16 @@ func (m *Manager) Stop() {
 This removes the instance from `AliveInstances` immediately, reducing the phantom window from 30s to effectively zero.
 
 The deregistration uses `sync.Once` to avoid double-deregister (both `Stop()` and the `defer` in `Start()` call it).
+
+### 2PC acknowledgement for unknown collections
+
+When a follower receives a prepare event for a collection it doesn't manage (e.g. a new collection added in a newer code version), it logs `"prepared"` instead of silently ignoring the event. This allows the leader's 2PC round to succeed without waiting for a 30s timeout.
+
+The semantic is correct: a pod that doesn't manage a collection has no state to protect — any version is acceptable. The commit and abort handlers already return early for unknown collections, so no data is applied.
+
+This works symmetrically:
+- **New pods syncing new collections** → old pods ACK
+- **Old pods syncing removed collections** → new pods ACK
 
 ## Kubernetes Configuration
 
@@ -79,23 +90,19 @@ spec:
 
 ### Readiness probe
 
-The readiness endpoint should return 200 only when **all** config data is loaded and usable. A pod without config is non-functional — it cannot serve game settings, product catalogs, or whatever the config contains.
+Use `manager.Ready()` — it returns true when every registered collection has been loaded (non-zero version). A pod without config is non-functional — it cannot serve game settings, product catalogs, or whatever the config contains.
 
 ```go
-func readyzHandler(collection *config.Collection[Item], settings *config.Singleton[Settings]) http.HandlerFunc {
-    return func(w http.ResponseWriter, r *http.Request) {
-        if collection.Count() == 0 {
-            w.WriteHeader(http.StatusServiceUnavailable)
-            return
-        }
-        if _, ok := settings.Get(); !ok {
-            w.WriteHeader(http.StatusServiceUnavailable)
-            return
-        }
-        w.WriteHeader(http.StatusOK)
+http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+    if !mgr.Ready() {
+        w.WriteHeader(http.StatusServiceUnavailable)
+        return
     }
-}
+    w.WriteHeader(http.StatusOK)
+})
 ```
+
+`Ready()` is lock-free (versions are read via `atomic.Pointer`) and safe to call on every probe.
 
 ### Why pods start fast
 
@@ -103,9 +110,11 @@ The manager startup sequence loads data in priority order:
 
 1. **Cache** (Redis) — sub-second, data available immediately
 2. **Storage** (Postgres active snapshot) — fast, skipped if cache was fresh
-3. **Source sync** — may be slow, but pod is already ready from step 1
+3. **Source sync** — only runs if `hasEmptyConfigs()` (ManualSyncOnly) or always (auto mode)
 
-With `ReadWriteThrough` cache strategy, pods become ready within ~350ms of starting — well before the source is contacted.
+With a hot cache, `Start()` loads all collections from cache, confirms versions match, and enters the event loop — no source or 2PC round-trips needed.
+
+Do **not** call `SyncNow()` before `Start()`. Since `SyncNow()` runs before cache is loaded, every collection has a zero version, triggering a full source fetch and 2PC round for each one — even when the cache already has fresh data.
 
 ### preStop hook
 
@@ -127,6 +136,27 @@ go func() {
 mgr.Stop()
 ```
 
+## Adding or removing collections
+
+When a rolling deploy adds a new collection, old pods (running previous code) don't have it registered. The 2PC acknowledgement for unknown collections ensures the sync succeeds without deadlock:
+
+1. New pod becomes leader, runs `leaderSync2PC` for the new collection
+2. Old pods receive prepare → unknown collection → log `"prepared"`
+3. Leader sees all pods prepared → commits → new collection synced
+4. Subsequent new pods load from cache → ready in ~1-2 seconds
+
+**Order of operations** for adding a collection:
+
+1. Create the collection in Directus (schema + data)
+2. Deploy code that registers it
+
+**Order of operations** for removing a collection:
+
+1. Deploy code without the collection
+2. Remove the collection from Directus
+
+This follows the standard expand-then-contract migration pattern.
+
 ## Stress testing
 
 The `example/11-rolling-stress/` directory contains a self-contained stress test:
@@ -144,5 +174,6 @@ See the example's README for usage.
 |---|---|---|
 | Leader vacuum on pod death | Up to 5 minutes | ~10 seconds |
 | Phantom instance in 2PC | Up to 30 seconds | ~0 (immediate deregister) |
-| New pod readiness | ~350ms (from cache) | ~350ms (unchanged) |
+| New collection deadlock in 2PC | Permanent (rolling deploy stuck) | ~0 (unknown collection ACK) |
+| New pod readiness | ~1-2s (from cache) | ~1-2s (unchanged) |
 | Rolling update (15 pods) | Works, but leader gap | Seamless |

@@ -880,6 +880,10 @@ func (m *Manager) checkPrepares(ctx context.Context, collection, version string,
 func (m *Manager) handlePrepareEvent(ctx context.Context, event notify.Event) {
 	reg, ok := m.configs[event.Collection]
 	if !ok {
+		// Unknown collection — acknowledge the prepare so the 2PC round
+		// is not blocked by pods that don't manage this collection
+		// (e.g. during rolling deployment when a new collection is added).
+		m.logApplyStatus(ctx, event.Collection, event.Version, applyStatusPrepared)
 		return
 	}
 

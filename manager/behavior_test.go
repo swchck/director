@@ -715,3 +715,109 @@ func TestManager_Maintenance_DisabledByDefault(t *testing.T) {
 	cancel()
 	<-errCh
 }
+
+// TestManager_Ready_ReflectsConfigState verifies that Ready() returns false
+// when any registered collection has no data and true once all are loaded.
+func TestManager_Ready_ReflectsConfigState(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	store := newMockStorage()
+	notif := newMockNotifier()
+	reg := &mockRegistry{count: 1}
+
+	src := &behaviorSource{
+		name:         "items",
+		items:        []twoPCArticle{{ID: 1, Name: "A"}},
+		lastModified: now,
+	}
+
+	items := config.NewCollection[twoPCArticle]("items")
+
+	mgr := manager.New(store, notif, reg, manager.Options{
+		PollInterval: time.Hour,
+		ServiceName:  "test-svc",
+	},
+		manager.WithInstanceID("node-1"),
+	)
+	manager.RegisterCollectionSource(mgr, items, src)
+
+	// Before Start: no data loaded → Ready must be false.
+	if mgr.Ready() {
+		t.Error("Ready() = true before Start(), want false")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.Start(ctx) }()
+
+	// After Start loads and syncs → Ready must become true.
+	waitFor(t, 3*time.Second, func() bool {
+		return mgr.Ready()
+	})
+
+	if !mgr.Ready() {
+		t.Error("Ready() = false after Start() loaded data, want true")
+	}
+
+	if items.Count() != 1 {
+		t.Errorf("items.Count() = %d, want 1", items.Count())
+	}
+
+	cancel()
+	<-errCh
+}
+
+// TestManager_Ready_FalseWhenPartiallyLoaded verifies that Ready() stays
+// false when only some collections have data.
+func TestManager_Ready_FalseWhenPartiallyLoaded(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	store := newMockStorage()
+	notif := newMockNotifier()
+	reg := &mockRegistry{count: 1}
+
+	srcA := &behaviorSource{
+		name:         "alpha",
+		items:        []twoPCArticle{{ID: 1, Name: "A"}},
+		lastModified: now,
+	}
+
+	// Source B always errors — simulates unavailable source.
+	srcB := &mockCollectionSource[twoPCArticle]{
+		items:      nil,
+		versionErr: errors.New("source unavailable"),
+	}
+
+	alpha := config.NewCollection[twoPCArticle]("alpha")
+	beta := config.NewCollection[twoPCArticle]("beta")
+
+	mgr := manager.New(store, notif, reg, manager.Options{
+		PollInterval: time.Hour,
+		ServiceName:  "test-svc",
+	},
+		manager.WithInstanceID("node-1"),
+	)
+	manager.RegisterCollectionSource(mgr, alpha, srcA)
+	manager.RegisterCollectionSource(mgr, beta, srcB)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.Start(ctx) }()
+
+	// Alpha should load, beta should fail.
+	waitFor(t, 3*time.Second, func() bool {
+		return alpha.Count() == 1
+	})
+
+	// Ready must be false because beta has no data.
+	if mgr.Ready() {
+		t.Error("Ready() = true with partially loaded collections, want false")
+	}
+
+	cancel()
+	<-errCh
+}
