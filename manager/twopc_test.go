@@ -1148,6 +1148,194 @@ func TestTwoPC_PublishCommitFailure_LeaderStillCommits(t *testing.T) {
 	<-errCh
 }
 
+// TestTwoPC_UnknownCollectionPrepareACK verifies that a follower receiving
+// a prepare for a collection it doesn't manage logs "prepared" instead of
+// silently ignoring the event. This prevents 2PC deadlocks during rolling
+// deployments that add new collections.
+func TestTwoPC_UnknownCollectionPrepareACK(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	store := newMockStorage()
+	reg := newTwoPCRegistry("follower")
+
+	// Source for the collection this follower DOES manage.
+	src := &twoPCSource{
+		items:        []twoPCArticle{{ID: 1, Name: "Known"}},
+		lastModified: now,
+	}
+
+	notif := newMockNotifier()
+
+	articles := config.NewCollection[twoPCArticle]("articles")
+
+	mgr := manager.New(store, notif, reg, manager.Options{
+		PollInterval:             time.Hour,
+		WaitConfirmationsTimeout: 500 * time.Millisecond,
+		PrepareTTL:               5 * time.Second,
+		ServiceName:              "test-svc",
+		RequireUnanimousApply:    true,
+	},
+		manager.WithInstanceID("follower"),
+	)
+	manager.RegisterCollectionSource(mgr, articles, src)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Send a prepare for a collection this follower does NOT manage.
+	unknownVersion := config.NewVersion(now).String()
+	notif.subCh <- notify.Event{
+		Action:     notify.ActionPrepare,
+		Collection: "new-products", // not registered
+		Version:    unknownVersion,
+		RoundID:    "round-unknown",
+	}
+
+	// The follower should log "prepared" for the unknown collection.
+	waitFor(t, 2*time.Second, func() bool {
+		ids, _ := store.AppliedInstances(ctx, "new-products", unknownVersion, "prepared")
+		return slices.Contains(ids, "follower")
+	})
+
+	ids, _ := store.AppliedInstances(ctx, "new-products", unknownVersion, "prepared")
+	if !slices.Contains(ids, "follower") {
+		t.Error("follower did not ACK prepare for unknown collection")
+	}
+
+	cancel()
+	<-errCh
+}
+
+// TestTwoPC_UnknownCollectionCommitIgnored verifies that commit and abort
+// events for unknown collections are silently ignored (no crash, no log entry).
+func TestTwoPC_UnknownCollectionCommitIgnored(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	store := newMockStorage()
+	reg := newTwoPCRegistry("follower")
+
+	src := &twoPCSource{
+		items:        []twoPCArticle{},
+		lastModified: now,
+	}
+
+	notif := newMockNotifier()
+
+	articles := config.NewCollection[twoPCArticle]("articles")
+
+	mgr := manager.New(store, notif, reg, manager.Options{
+		PollInterval:             time.Hour,
+		WaitConfirmationsTimeout: 500 * time.Millisecond,
+		PrepareTTL:               5 * time.Second,
+		ServiceName:              "test-svc",
+		RequireUnanimousApply:    true,
+	},
+		manager.WithInstanceID("follower"),
+	)
+	manager.RegisterCollectionSource(mgr, articles, src)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Send commit and abort for unknown collections — must not panic.
+	notif.subCh <- notify.Event{
+		Action:     notify.ActionCommit,
+		Collection: "unknown-col",
+		Version:    config.NewVersion(now).String(),
+		RoundID:    "round-unknown",
+	}
+	notif.subCh <- notify.Event{
+		Action:     notify.ActionAbort,
+		Collection: "unknown-col",
+		Version:    config.NewVersion(now).String(),
+		RoundID:    "round-unknown",
+	}
+
+	// Give events time to be processed.
+	time.Sleep(300 * time.Millisecond)
+
+	// No committed status should be logged for unknown collection.
+	ids, _ := store.AppliedInstances(ctx, "unknown-col", config.NewVersion(now).String(), "committed")
+	if len(ids) != 0 {
+		t.Errorf("unexpected committed status for unknown collection: %v", ids)
+	}
+
+	cancel()
+	<-errCh
+}
+
+// TestTwoPC_RollingDeployNewCollection simulates a rolling deployment scenario:
+// the leader registers a new collection that followers don't know about.
+// With the unknown-collection ACK, the 2PC round must succeed.
+func TestTwoPC_RollingDeployNewCollection(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	store := newMockStorage()
+	// "leader" is new code, "old-follower-1/2" are old code.
+	reg := newTwoPCRegistry("leader", "old-follower-1", "old-follower-2")
+
+	src := &twoPCSource{
+		items:        []twoPCArticle{{ID: 1, Name: "New Product"}},
+		lastModified: now,
+	}
+
+	notif := newTwoPCNotifier()
+	// Old followers ACK prepare for unknown collections by writing "prepared"
+	// directly to storage (simulating the handlePrepareEvent behavior).
+	notif.onPublish = func(ctx context.Context, ev notify.Event) {
+		if ev.Action != notify.ActionPrepare {
+			return
+		}
+		go func() {
+			_ = store.LogApply(ctx, "old-follower-1", ev.Collection, ev.Version, "prepared")
+			_ = store.LogApply(ctx, "old-follower-2", ev.Collection, ev.Version, "prepared")
+		}()
+	}
+
+	mgr, articles := build2PCManager(t, store, notif, reg, src)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.Start(ctx) }()
+
+	// The new collection must be committed despite old followers not
+	// actually managing it.
+	waitFor(t, 3*time.Second, func() bool {
+		return articles.Count() == 1
+	})
+
+	if articles.Count() != 1 {
+		t.Fatalf("articles.Count() = %d, want 1 (rolling deploy new collection)", articles.Count())
+	}
+
+	// Verify commit was published.
+	var sawCommit bool
+	for _, ev := range notif.publishedEvents() {
+		if ev.Action == notify.ActionCommit {
+			sawCommit = true
+			break
+		}
+	}
+	if !sawCommit {
+		t.Error("expected commit event for new collection during rolling deploy")
+	}
+
+	cancel()
+	<-errCh
+}
+
 // -- small helpers ---------------------------------------------------------
 
 func waitFor(t *testing.T, timeout time.Duration, predicate func() bool) {

@@ -154,6 +154,14 @@ func (m *Manager) hasEmptyConfigs() bool {
 	return false
 }
 
+// Ready reports whether all registered configs have been loaded
+// (every config has a non-zero version). Intended for use in Kubernetes
+// readiness probes so that the pod does not receive traffic until the
+// manager has applied config from cache, storage, or the source.
+func (m *Manager) Ready() bool {
+	return !m.hasEmptyConfigs()
+}
+
 // Start begins the config sync lifecycle. It blocks until ctx is cancelled
 // or Stop is called.
 //
