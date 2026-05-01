@@ -27,16 +27,21 @@ func (m *Manager) syncAll(ctx context.Context) bool {
 	if err != nil {
 		if errors.Is(err, storage.ErrLockNotAcquired) {
 			// Another instance is leader — nothing to do, follower reacts to notifications.
+			m.isLeader.Store(false)
 			return false
 		}
 
 		m.logger.Error("manager: acquire lock failed", dlog.Err(err))
+		m.isLeader.Store(false)
 		return false
 	}
+	m.isLeader.Store(true)
 	defer release()
 
 	for _, reg := range m.configs {
-		if err := m.leaderSync(ctx, reg, false); err != nil {
+		err := m.leaderSync(ctx, reg, false)
+		m.recordSync(reg.name(), err)
+		if err != nil {
 			m.metrics.SyncFailed(reg.name(), err)
 			if errors.Is(err, ErrValidationFailed) {
 				// reg.fetchAndSwap / fetchAndStage already deduped + warn-logged
