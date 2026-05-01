@@ -506,6 +506,31 @@ func (c *Client) DeleteField(ctx context.Context, collection, field string) erro
 	return nil
 }
 
+// CollectionField is a minimal description of a Directus field returned by
+// ListFields. Captures only what's needed for schema drift detection — name
+// plus the declared type. Use CreateField/UpdateField for the full FieldInput
+// shape.
+type CollectionField struct {
+	Field string    `json:"field"`
+	Type  FieldType `json:"type"`
+}
+
+// ListFields returns the fields declared on a Directus collection. Used by
+// the manager's schema-drift check to compare the live Directus schema
+// against the Go struct backing a registered collection.
+func (c *Client) ListFields(ctx context.Context, collection string) ([]CollectionField, error) {
+	raw, err := c.Get(ctx, "fields/"+collection, nil)
+	if err != nil {
+		return nil, fmt.Errorf("directus: list fields %s: %w", collection, err)
+	}
+
+	var fields []CollectionField
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, fmt.Errorf("directus: decode fields %s: %w", collection, err)
+	}
+	return fields, nil
+}
+
 // RelationInput defines a relationship between two collections.
 type RelationInput struct {
 	Collection string          `json:"collection"`

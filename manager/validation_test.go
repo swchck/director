@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,11 +35,13 @@ func (l *captureLogger) Warn(msg string, fields ...dlog.Field) {
 	var b strings.Builder
 	b.WriteString(msg)
 	for _, f := range fields {
-		if f.Key == "version" {
-			if s, ok := f.Value.(string); ok {
-				b.WriteString(" v=")
-				b.WriteString(s)
-			}
+		b.WriteString(" ")
+		b.WriteString(f.Key)
+		b.WriteString("=")
+		if s, ok := f.Value.(string); ok {
+			b.WriteString(s)
+		} else {
+			fmt.Fprintf(&b, "%v", f.Value)
 		}
 	}
 	l.mu.Lock()

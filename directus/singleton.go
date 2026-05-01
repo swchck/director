@@ -30,6 +30,13 @@ func (s *Singleton[T]) Collection() string {
 	return s.collection
 }
 
+// Client returns the underlying Directus client. Useful when a caller already
+// holds a Singleton wrapper and needs ad-hoc REST calls (e.g. ListFields for
+// schema introspection) without re-threading the client.
+func (s *Singleton[T]) Client() *Client {
+	return s.client
+}
+
 // Get fetches the singleton item.
 // Use WithFields with dot notation to include relational data (e.g. "translations.*").
 func (s *Singleton[T]) Get(ctx context.Context, opts ...QueryOption) (*T, error) {

@@ -817,6 +817,12 @@ func RegisterSingletonSource[T any](m *Manager, cfg *config.Singleton[T], src so
 // To attach a validator or other manager-level options, use
 // RegisterCollectionSource with source.FromDirectus instead.
 func RegisterCollection[T any](m *Manager, cfg *config.Collection[T], items *directus.Items[T], opts ...directus.QueryOption) {
+	var sample T
+	m.schemaCheckEntries = append(m.schemaCheckEntries, schemaCheckEntry{
+		collection: items.Collection(),
+		client:     items.Client(),
+		sample:     sample,
+	})
 	RegisterCollectionSource(m, cfg, source.FromDirectus(items, opts...))
 }
 
@@ -824,5 +830,11 @@ func RegisterCollection[T any](m *Manager, cfg *config.Collection[T], items *dir
 // This is a convenience wrapper that creates a source.SingletonSource from directus.Singleton[T].
 // To attach a validator, use RegisterSingletonSource with source.FromDirectusSingleton.
 func RegisterSingleton[T any](m *Manager, cfg *config.Singleton[T], singleton *directus.Singleton[T], opts ...directus.QueryOption) {
+	var sample T
+	m.schemaCheckEntries = append(m.schemaCheckEntries, schemaCheckEntry{
+		collection: singleton.Collection(),
+		client:     singleton.Client(),
+		sample:     sample,
+	})
 	RegisterSingletonSource(m, cfg, source.FromDirectusSingleton(singleton, opts...))
 }
