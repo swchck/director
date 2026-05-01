@@ -208,6 +208,7 @@ func (m *Manager) leaderSync(ctx context.Context, reg registrable, force bool) e
 	currentVersion := reg.version()
 
 	if !force && !currentVersion.IsZero() && newVersion.Equal(currentVersion) {
+		m.repairCacheEntry(ctx, collection)
 		m.logger.Debug("manager: no version change, skipping sync",
 			dlog.String("collection", collection),
 			dlog.String("version", currentVersion.String()),
@@ -276,6 +277,68 @@ func (m *Manager) leaderSync(ctx context.Context, reg registrable, force bool) e
 	)
 
 	return nil
+}
+
+// repairCacheEntry writes the active snapshot of one collection to cache if
+// the cache entry is missing. The caller MUST hold the advisory lock so the
+// "only the leader writes to cache" invariant is preserved: the lock holder
+// is, for the duration of this call, the leader. The bytes come from the
+// storage active snapshot — the canonical source — so they cannot drift
+// from what followers would observe by reading storage directly.
+//
+// No-op when the cache is disabled, the strategy doesn't write to cache, the
+// entry is already warm, or the active snapshot is missing/unreachable.
+func (m *Manager) repairCacheEntry(ctx context.Context, collection string) {
+	if m.cache == nil || !m.cacheStrategy.WritesToCache() {
+		return
+	}
+
+	if _, err := m.cache.Get(ctx, collection); err == nil {
+		return // already warm
+	} else if !errors.Is(err, cache.ErrCacheMiss) {
+		m.logger.Warn("manager: cache repair read failed",
+			dlog.Err(err), dlog.String("collection", collection))
+		return
+	}
+
+	snap, err := m.storage.GetActiveSnapshot(ctx, collection)
+	if err != nil {
+		if !errors.Is(err, storage.ErrSnapshotNotFound) {
+			m.logger.Warn("manager: cache repair load snapshot failed",
+				dlog.Err(err), dlog.String("collection", collection))
+		}
+		return
+	}
+
+	m.cacheWrite(ctx, collection, snap.Version, snap.Content)
+	m.logger.Info("manager: warmed cold cache",
+		dlog.String("collection", collection),
+		dlog.String("version", snap.Version),
+	)
+}
+
+// warmCacheIfMissing acquires the advisory lock and writes any cold cache
+// entries from active snapshots in storage. Used during startup in
+// ManualSyncOnly mode where the version-skip path of leaderSync would not
+// otherwise run. If another instance holds the lock, this is a no-op — that
+// instance will repair on its own startup or next poll cycle.
+func (m *Manager) warmCacheIfMissing(ctx context.Context) {
+	if m.cache == nil || !m.cacheStrategy.WritesToCache() {
+		return
+	}
+
+	release, err := m.storage.AcquireLock(ctx, m.opts.AdvisoryLockKey)
+	if err != nil {
+		if !errors.Is(err, storage.ErrLockNotAcquired) {
+			m.logger.Warn("manager: cache warm acquire lock failed", dlog.Err(err))
+		}
+		return
+	}
+	defer release()
+
+	for _, reg := range m.configs {
+		m.repairCacheEntry(ctx, reg.name())
+	}
 }
 
 // cacheWrite writes an entry to cache if the strategy requires it.
@@ -620,6 +683,7 @@ func (m *Manager) leaderSync2PC(ctx context.Context, reg registrable, force bool
 	currentVersion := reg.version()
 
 	if !force && !currentVersion.IsZero() && newVersion.Equal(currentVersion) {
+		m.repairCacheEntry(ctx, collection)
 		m.logger.Debug("manager: no version change, skipping 2PC sync",
 			dlog.String("collection", collection),
 			dlog.String("version", currentVersion.String()),
