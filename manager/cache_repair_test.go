@@ -19,7 +19,7 @@ import (
 type trackingCache struct {
 	mu       sync.Mutex
 	entries  map[string]*cache.Entry
-	setCalls int32
+	setCalls atomic.Int32
 	getErr   error // if non-nil, Get returns this error instead of looking up
 }
 
@@ -43,7 +43,7 @@ func (c *trackingCache) Get(_ context.Context, collection string) (*cache.Entry,
 }
 
 func (c *trackingCache) Set(_ context.Context, entry cache.Entry) error {
-	atomic.AddInt32(&c.setCalls, 1)
+	c.setCalls.Add(1)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -54,25 +54,30 @@ func (c *trackingCache) Set(_ context.Context, entry cache.Entry) error {
 func (c *trackingCache) Delete(_ context.Context, _ string) error { return nil }
 func (c *trackingCache) Close() error                             { return nil }
 
-func (c *trackingCache) setCount() int32 { return atomic.LoadInt32(&c.setCalls) }
-func (c *trackingCache) getEntry(collection string) *cache.Entry {
+func (c *trackingCache) setCount() int32 { return c.setCalls.Load() }
+
+// articlesEntry is a convenience accessor used by every cache-repair test —
+// they all register a single "articles" collection.
+func (c *trackingCache) articlesEntry() *cache.Entry {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.entries[collection]
+	return c.entries["articles"]
 }
 
-// seedActiveSnapshot writes an active snapshot to mock storage.
-func seedActiveSnapshot(t *testing.T, store *mockStorage, collection, version string, items []twoPCArticle) {
+// seedActiveSnapshot writes an active snapshot for the "articles" collection
+// to mock storage. The collection name is fixed because every cache-repair
+// test exercises a single registered collection.
+func seedActiveSnapshot(t *testing.T, store *mockStorage, version string, items []twoPCArticle) {
 	t.Helper()
 	payload, err := json.Marshal(items)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 	ctx := context.Background()
-	if err := store.SaveSnapshot(ctx, collection, version, payload); err != nil {
+	if err := store.SaveSnapshot(ctx, "articles", version, payload); err != nil {
 		t.Fatalf("SaveSnapshot: %v", err)
 	}
-	if err := store.ActivateSnapshot(ctx, collection, version); err != nil {
+	if err := store.ActivateSnapshot(ctx, "articles", version); err != nil {
 		t.Fatalf("ActivateSnapshot: %v", err)
 	}
 }
@@ -88,7 +93,7 @@ func TestCacheRepair_LeaderSyncWarmsColdCache(t *testing.T) {
 	notif := newMockNotifier()
 	reg := newMockRegistry()
 
-	seedActiveSnapshot(t, store, "articles", versionStr, []twoPCArticle{{ID: 1, Name: "Alpha"}})
+	seedActiveSnapshot(t, store, versionStr, []twoPCArticle{{ID: 1, Name: "Alpha"}})
 
 	tc := newTrackingCache()
 
@@ -115,10 +120,10 @@ func TestCacheRepair_LeaderSyncWarmsColdCache(t *testing.T) {
 	go func() { errCh <- mgr.Start(ctx) }()
 
 	waitFor(t, 3*time.Second, func() bool {
-		return tc.getEntry("articles") != nil
+		return tc.articlesEntry() != nil
 	})
 
-	entry := tc.getEntry("articles")
+	entry := tc.articlesEntry()
 	if entry == nil {
 		t.Fatal("cache was not warmed after version-skip sync")
 	}
@@ -140,7 +145,7 @@ func TestCacheRepair_NoOpWhenCacheHot(t *testing.T) {
 	notif := newMockNotifier()
 	reg := newMockRegistry()
 
-	seedActiveSnapshot(t, store, "articles", versionStr, []twoPCArticle{{ID: 1, Name: "Alpha"}})
+	seedActiveSnapshot(t, store, versionStr, []twoPCArticle{{ID: 1, Name: "Alpha"}})
 
 	payload, _ := json.Marshal([]twoPCArticle{{ID: 1, Name: "Alpha"}})
 	tc := newTrackingCache()
@@ -197,7 +202,7 @@ func TestCacheRepair_NoOpWhenWritesDisabled(t *testing.T) {
 	notif := newMockNotifier()
 	reg := newMockRegistry()
 
-	seedActiveSnapshot(t, store, "articles", versionStr, []twoPCArticle{{ID: 1, Name: "Alpha"}})
+	seedActiveSnapshot(t, store, versionStr, []twoPCArticle{{ID: 1, Name: "Alpha"}})
 
 	tc := newTrackingCache()
 
@@ -231,7 +236,7 @@ func TestCacheRepair_NoOpWhenWritesDisabled(t *testing.T) {
 	if got := tc.setCount(); got != 0 {
 		t.Errorf("cache.Set called %d times under ReadThrough; want 0", got)
 	}
-	if tc.getEntry("articles") != nil {
+	if tc.articlesEntry() != nil {
 		t.Error("cache populated under ReadThrough strategy")
 	}
 
@@ -251,7 +256,7 @@ func TestCacheRepair_ManualSyncOnly_WarmsOnStartup(t *testing.T) {
 	notif := newMockNotifier()
 	reg := newMockRegistry()
 
-	seedActiveSnapshot(t, store, "articles", versionStr, []twoPCArticle{{ID: 1, Name: "Alpha"}})
+	seedActiveSnapshot(t, store, versionStr, []twoPCArticle{{ID: 1, Name: "Alpha"}})
 
 	tc := newTrackingCache()
 
@@ -275,10 +280,10 @@ func TestCacheRepair_ManualSyncOnly_WarmsOnStartup(t *testing.T) {
 	go func() { errCh <- mgr.Start(ctx) }()
 
 	waitFor(t, 3*time.Second, func() bool {
-		return tc.getEntry("articles") != nil
+		return tc.articlesEntry() != nil
 	})
 
-	entry := tc.getEntry("articles")
+	entry := tc.articlesEntry()
 	if entry == nil {
 		t.Fatal("cache not warmed in ManualSyncOnly startup")
 	}
@@ -309,7 +314,7 @@ func TestCacheRepair_SwallowsCacheReadError(t *testing.T) {
 	notif := newMockNotifier()
 	reg := newMockRegistry()
 
-	seedActiveSnapshot(t, store, "articles", versionStr, []twoPCArticle{{ID: 1, Name: "Alpha"}})
+	seedActiveSnapshot(t, store, versionStr, []twoPCArticle{{ID: 1, Name: "Alpha"}})
 
 	tc := newTrackingCache()
 	tc.getErr = errors.New("simulated redis network blip")
@@ -363,7 +368,7 @@ func TestCacheRepair_2PCWarmsColdCache(t *testing.T) {
 	reg := newTwoPCRegistry("leader") // single instance, no followers
 	notif := newTwoPCNotifier()
 
-	seedActiveSnapshot(t, store, "articles", versionStr, []twoPCArticle{{ID: 1, Name: "Alpha"}})
+	seedActiveSnapshot(t, store, versionStr, []twoPCArticle{{ID: 1, Name: "Alpha"}})
 
 	tc := newTrackingCache()
 
@@ -393,10 +398,10 @@ func TestCacheRepair_2PCWarmsColdCache(t *testing.T) {
 	go func() { errCh <- mgr.Start(ctx) }()
 
 	waitFor(t, 3*time.Second, func() bool {
-		return tc.getEntry("articles") != nil
+		return tc.articlesEntry() != nil
 	})
 
-	entry := tc.getEntry("articles")
+	entry := tc.articlesEntry()
 	if entry == nil {
 		t.Fatal("2PC version-skip did not warm cache")
 	}

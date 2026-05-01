@@ -205,15 +205,16 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.loadFromStorage(ctx)
 
 	// 4. Initial sync.
-	if !m.opts.ManualSyncOnly {
+	switch {
+	case !m.opts.ManualSyncOnly:
 		m.syncAll(ctx)
-	} else if m.hasEmptyConfigs() {
+	case m.hasEmptyConfigs():
 		// Manual mode bootstrap: if cache and storage had no data for some
 		// collections (first deploy), sync once from the source so the
 		// service starts with a valid config. Subsequent updates are manual.
 		m.logger.Info("manager: manual mode bootstrap — empty collections detected, running initial sync")
 		m.syncAll(ctx)
-	} else {
+	default:
 		// Manual mode with data already loaded from storage: syncAll is
 		// skipped, so its version-skip cache repair never fires. Warm the
 		// cache here so subsequent rolling-restart pods can start from cache
