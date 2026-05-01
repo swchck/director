@@ -106,7 +106,7 @@ func TestStatus_AfterSuccessfulSync(t *testing.T) {
 
 	// Poll for sync completion instead of fixed sleep — sync timing varies
 	// with HTTP overhead and race-detector slowdown.
-	s := waitForStatus(t, mgr, "articles", 3*time.Second, func(c manager.ConfigStatus) bool {
+	s := waitForArticleSync(t, mgr, func(c manager.ConfigStatus) bool {
 		return !c.LastSyncAt.IsZero() && c.Version != ""
 	})
 
@@ -134,21 +134,22 @@ func TestStatus_AfterSuccessfulSync(t *testing.T) {
 	}
 }
 
-// waitForStatus polls mgr.Status until cond returns true for the named
-// config, or timeout elapses.
-func waitForStatus(t *testing.T, mgr *manager.Manager, name string, timeout time.Duration, cond func(manager.ConfigStatus) bool) manager.Status {
+// waitForArticleSync polls mgr.Status up to 3s waiting for cond to return
+// true for the "articles" config. Test fixtures all register a single
+// "articles" collection, so a hardcoded name keeps the helper terse.
+func waitForArticleSync(t *testing.T, mgr *manager.Manager, cond func(manager.ConfigStatus) bool) manager.Status {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		s := mgr.Status()
 		for _, c := range s.Configs {
-			if c.Name == name && cond(c) {
+			if c.Name == "articles" && cond(c) {
 				return s
 			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("waitForStatus: condition never met for %q within %v", name, timeout)
+	t.Fatalf("waitForArticleSync: condition never met within 3s")
 	return manager.Status{}
 }
 
@@ -177,7 +178,7 @@ func TestStatus_AfterFailedSync(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- mgr.Start(ctx) }()
 
-	s := waitForStatus(t, mgr, "articles", 3*time.Second, func(c manager.ConfigStatus) bool {
+	s := waitForArticleSync(t, mgr, func(c manager.ConfigStatus) bool {
 		return c.LastSyncErr != ""
 	})
 

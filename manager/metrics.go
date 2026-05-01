@@ -76,6 +76,17 @@ type Metrics interface {
 	// fetched or staged value. Emitted at most once per (collection, version);
 	// repeated rejections of the same version are suppressed.
 	ValidationFailed(collection string)
+
+	// LeaderAcquired is called when this instance transitions from follower
+	// to leader (i.e. it just acquired the advisory lock for a sync cycle
+	// after not holding it on the previous cycle). Useful for tracking
+	// leadership churn and rolling-deployment leadership handoff.
+	LeaderAcquired(serviceName string)
+
+	// LeaderLost is called when this instance transitions from leader to
+	// follower (i.e. it failed to acquire the advisory lock on a sync cycle
+	// after holding it on the previous one).
+	LeaderLost(serviceName string)
 }
 
 // nopMetrics is the default no-op implementation.
@@ -96,6 +107,8 @@ func (nopMetrics) FollowerPrepared(string)                  {}
 func (nopMetrics) FollowerPrepareFailed(string, error)      {}
 func (nopMetrics) StagedDropped(string, string)             {}
 func (nopMetrics) ValidationFailed(string)                  {}
+func (nopMetrics) LeaderAcquired(string)                    {}
+func (nopMetrics) LeaderLost(string)                        {}
 
 // NopMetrics returns a Metrics implementation that discards all telemetry.
 func NopMetrics() Metrics {
