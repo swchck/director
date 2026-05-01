@@ -23,19 +23,30 @@ var errPrepareFailed = errors.New("manager: prepare phase failed")
 // If this instance holds the advisory lock, it acts as leader; otherwise follower.
 // Returns true if this instance acted as leader.
 func (m *Manager) syncAll(ctx context.Context) bool {
+	prevLeader := m.isLeader.Load()
+
 	release, err := m.storage.AcquireLock(ctx, m.opts.AdvisoryLockKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrLockNotAcquired) {
 			// Another instance is leader — nothing to do, follower reacts to notifications.
 			m.isLeader.Store(false)
+			if prevLeader {
+				m.metrics.LeaderLost(m.opts.ServiceName)
+			}
 			return false
 		}
 
 		m.logger.Error("manager: acquire lock failed", dlog.Err(err))
 		m.isLeader.Store(false)
+		if prevLeader {
+			m.metrics.LeaderLost(m.opts.ServiceName)
+		}
 		return false
 	}
 	m.isLeader.Store(true)
+	if !prevLeader {
+		m.metrics.LeaderAcquired(m.opts.ServiceName)
+	}
 	defer release()
 
 	for _, reg := range m.configs {
