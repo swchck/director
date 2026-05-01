@@ -53,6 +53,11 @@ type Manager struct {
 	// Status(). Keyed by collection name.
 	syncStateMu sync.RWMutex
 	syncState   map[string]syncStateEntry
+
+	// schemaCheck gates the optional Directus drift check at Start. Off by
+	// default; turned on with WithSchemaCheck.
+	schemaCheck        bool
+	schemaCheckEntries []schemaCheckEntry
 }
 
 // New creates a new Manager.
@@ -115,6 +120,24 @@ func WithInstanceID(id string) ManagerOption {
 func WithMetrics(metrics Metrics) ManagerOption {
 	return func(m *Manager) {
 		m.metrics = metrics
+	}
+}
+
+// WithSchemaCheck enables a startup-only check that warns when a Go struct
+// declared by a Directus-backed registration references a field that does
+// not exist in the live Directus schema. Useful for catching silent data
+// loss caused by an admin renaming or deleting a field.
+//
+// Off by default. Only checks collections registered via RegisterCollection
+// / RegisterSingleton (the Directus shorthands); generic
+// RegisterCollectionSource / RegisterSingletonSource registrations do not
+// expose enough information to introspect.
+//
+// Failures fetching the schema are logged and skipped — schema check never
+// blocks startup.
+func WithSchemaCheck() ManagerOption {
+	return func(m *Manager) {
+		m.schemaCheck = true
 	}
 }
 
@@ -202,6 +225,9 @@ func (m *Manager) Start(ctx context.Context) error {
 	if err := m.registry.Register(ctx, m.instanceID, m.opts.ServiceName); err != nil {
 		return fmt.Errorf("manager: register instance: %w", err)
 	}
+
+	// Optional schema drift check — warnings only, never fails startup.
+	m.runSchemaChecks(ctx)
 
 	defer m.deregisterOnce.Do(func() {
 		if err := m.registry.Deregister(context.Background(), m.instanceID); err != nil {

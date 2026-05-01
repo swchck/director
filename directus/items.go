@@ -26,6 +26,13 @@ func (i *Items[T]) Collection() string {
 	return i.collection
 }
 
+// Client returns the underlying Directus client. Useful when a caller already
+// holds an Items wrapper and needs ad-hoc REST calls (e.g. ListFields for
+// schema introspection) without re-threading the client.
+func (i *Items[T]) Client() *Client {
+	return i.client
+}
+
 // List fetches items from the collection with optional filtering, sorting, and pagination.
 // Supports relational fields via WithFields (dot notation) and WithDeep for nested queries.
 func (i *Items[T]) List(ctx context.Context, opts ...QueryOption) ([]T, error) {
