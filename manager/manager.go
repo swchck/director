@@ -43,6 +43,16 @@ type Manager struct {
 	cancel         context.CancelFunc
 	started        atomic.Bool
 	deregisterOnce sync.Once
+
+	// isLeader records whether this instance held the advisory lock at the
+	// last sync attempt. Surfaced via Status() — best-effort, not a strong
+	// guarantee that we are leader right now.
+	isLeader atomic.Bool
+
+	// syncState tracks the most recent sync attempt per collection for
+	// Status(). Keyed by collection name.
+	syncStateMu sync.RWMutex
+	syncState   map[string]syncStateEntry
 }
 
 // New creates a new Manager.
@@ -63,6 +73,7 @@ func New(
 		logger:     dlog.Nop(),
 		metrics:    NopMetrics(),
 		configs:    make(map[string]registrable),
+		syncState:  make(map[string]syncStateEntry),
 		instanceID: uuid.New().String(),
 		opts:       opts.withDefaults(),
 	}

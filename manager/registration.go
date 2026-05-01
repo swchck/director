@@ -95,6 +95,13 @@ type registrable interface {
 	// also marks the (ver, kind) tuple as reported, so subsequent calls with
 	// the same arguments return false until the next successful apply.
 	shouldReport(ver config.Version, kind string) bool
+
+	// kind reports whether this registration backs a collection or singleton.
+	kind() ConfigKind
+
+	// itemCount reports the number of items currently held in memory.
+	// Collections return their length; singletons return 0.
+	itemCount() int
 }
 
 // stagedCollection holds a staged collection value awaiting commit.
@@ -171,6 +178,10 @@ func (r *collectionReg[T]) version() config.Version {
 func (r *collectionReg[T]) fetchVersion(ctx context.Context) (time.Time, error) {
 	return r.src.LastModified(ctx)
 }
+
+func (r *collectionReg[T]) kind() ConfigKind { return ConfigKindCollection }
+
+func (r *collectionReg[T]) itemCount() int { return r.cfg.Count() }
 
 func (r *collectionReg[T]) reportFailure(ver config.Version, kind string, err error) {
 	if !r.failure.shouldLog(ver, kind) {
@@ -456,6 +467,10 @@ func (r *singletonReg[T]) version() config.Version {
 func (r *singletonReg[T]) fetchVersion(ctx context.Context) (time.Time, error) {
 	return r.src.LastModified(ctx)
 }
+
+func (r *singletonReg[T]) kind() ConfigKind { return ConfigKindSingleton }
+
+func (r *singletonReg[T]) itemCount() int { return 0 }
 
 func (r *singletonReg[T]) reportFailure(ver config.Version, kind string, err error) {
 	if !r.failure.shouldLog(ver, kind) {
