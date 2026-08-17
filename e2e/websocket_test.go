@@ -27,7 +27,6 @@ func TestE2E_WebSocket_SubscriptionReceivesEvents(t *testing.T) {
 
 	t.Cleanup(func() { cleanupCollection(t, dc, "e2e_ws_events") })
 
-	// Create collection.
 	err := dc.CreateCollection(ctx, directus.CreateCollectionInput{
 		Collection: "e2e_ws_events",
 		Fields: []directus.FieldInput{
@@ -39,7 +38,6 @@ func TestE2E_WebSocket_SubscriptionReceivesEvents(t *testing.T) {
 		t.Fatalf("create collection: %v", err)
 	}
 
-	// Connect WebSocket and subscribe.
 	token := getAdminJWT(t)
 	ws := directus.NewWSClient(testDirectusURL, token,
 		directus.WithWSLogger(testLogger(t)),
@@ -72,7 +70,6 @@ func TestE2E_WebSocket_SubscriptionReceivesEvents(t *testing.T) {
 		t.Fatalf("create item: %v", err)
 	}
 
-	// Wait for the WebSocket event.
 	select {
 	case event := <-events:
 		if event.Action != "create" {
@@ -124,7 +121,6 @@ func TestE2E_WebSocket_ManagerAutoSyncsOnChange(t *testing.T) {
 		t.Fatalf("create date_updated: %v", err)
 	}
 
-	// Seed initial data.
 	type SyncItem struct {
 		ID    int    `json:"id"`
 		Name  string `json:"name"`
@@ -150,7 +146,6 @@ func TestE2E_WebSocket_ManagerAutoSyncsOnChange(t *testing.T) {
 		_, _ = syncItems.Update(ctx, "1", &SyncItem{Name: "initial", Score: 10})
 	}
 
-	// Set up infrastructure.
 	pgPool := testPgPool(t)
 	rdb := testRedisClient(t)
 
@@ -163,17 +158,14 @@ func TestE2E_WebSocket_ManagerAutoSyncsOnChange(t *testing.T) {
 	reg := pgregistry.NewRegistry(pgPool)
 	redisCache := rediscache.NewCache(rdb, rediscache.WithTTL(5*time.Minute))
 
-	// Create WebSocket client.
 	token := getAdminJWT(t)
 	ws := directus.NewWSClient(testDirectusURL, token,
 		directus.WithWSLogger(testLogger(t)),
 	)
 	t.Cleanup(func() { ws.Close() })
 
-	// Define config.
 	config := dcfg.NewCollection[SyncItem]("e2e_ws_sync")
 
-	// Create manager with WebSocket.
 	mgr := manager.New(store, notif, reg,
 		manager.Options{
 			PollInterval:             time.Hour, // Long — we rely on WS, not polling.
@@ -187,7 +179,6 @@ func TestE2E_WebSocket_ManagerAutoSyncsOnChange(t *testing.T) {
 
 	manager.RegisterCollection(mgr, config, syncItems)
 
-	// Start manager.
 	mgrCtx, mgrCancel := context.WithCancel(ctx)
 	defer mgrCancel()
 
@@ -197,7 +188,6 @@ func TestE2E_WebSocket_ManagerAutoSyncsOnChange(t *testing.T) {
 	// Wait for initial sync.
 	time.Sleep(3 * time.Second)
 
-	// Verify initial state.
 	if config.Count() != 1 {
 		t.Fatalf("initial: Count() = %d, want 1", config.Count())
 	}
@@ -226,8 +216,7 @@ func TestE2E_WebSocket_ManagerAutoSyncsOnChange(t *testing.T) {
 			&SyncItem{Name: "ws-triggered", Score: 99})
 	}
 
-	// Wait for WS event → manager sync cycle.
-	// The WS event should trigger syncOne → leaderSync → full refetch.
+	// Wait for the WS event to drive a full sync cycle.
 	deadline := time.After(15 * time.Second)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -244,7 +233,6 @@ func TestE2E_WebSocket_ManagerAutoSyncsOnChange(t *testing.T) {
 		}
 	}
 
-	// Verify the new item is in the config.
 	wsItem, ok := config.Find(func(i SyncItem) bool { return i.Name == "ws-triggered" })
 	if !ok {
 		t.Fatal("ws-triggered item not found after WS sync")
@@ -307,7 +295,6 @@ func TestE2E_WebSocket_UpdateTriggersResync(t *testing.T) {
 	// Touch to populate date_updated.
 	_, _ = items.Update(ctx, "1", &UpdateItem{Name: "target", Value: 100})
 
-	// Infrastructure.
 	pgPool := testPgPool(t)
 	rdb := testRedisClient(t)
 
@@ -341,7 +328,6 @@ func TestE2E_WebSocket_UpdateTriggersResync(t *testing.T) {
 	go mgr.Start(mgrCtx)
 	time.Sleep(3 * time.Second)
 
-	// Verify initial.
 	found, ok := config.Find(func(i UpdateItem) bool { return i.Name == "target" })
 	if !ok {
 		t.Fatal("target not found")

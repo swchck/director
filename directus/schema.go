@@ -25,11 +25,9 @@ type CollectionMeta struct {
 	Color     string `json:"color,omitempty"`
 	Hidden    bool   `json:"hidden,omitempty"`
 	Sort      int    `json:"sort,omitempty"`
-	// Group is the name of the parent collection folder.
-	// Set this to place a collection inside a folder.
+	// Group is the parent collection folder this collection sits in.
 	Group string `json:"group,omitempty"`
-	// Collapse controls the default display state when this is a folder.
-	// One of: "open", "closed", "locked".
+	// Collapse applies only when this collection is itself a folder.
 	Collapse CollapseMode `json:"collapse,omitempty"`
 }
 
@@ -37,13 +35,12 @@ type CollectionMeta struct {
 type CreateCollectionInput struct {
 	Collection string          `json:"collection"`
 	Meta       *CollectionMeta `json:"meta,omitempty"`
-	// Schema must be present for Directus to create the database table.
-	// For collection folders, Schema is nil which serializes to "schema": null.
+	// Schema must be present, hence no omitempty: {} makes Directus create the
+	// database table, null (nil pointer) makes a folder with no table.
 	Schema *SchemaOptions `json:"schema"`
 	Fields []FieldInput   `json:"fields,omitempty"`
 
-	// isFolder is set internally by CreateCollectionFolder to prevent
-	// auto-filling Schema with an empty object.
+	// isFolder keeps CreateCollection from auto-filling Schema with an empty object.
 	isFolder bool `json:"-"`
 }
 
@@ -53,29 +50,15 @@ type SchemaOptions struct {
 	Comment string `json:"comment,omitempty"`
 }
 
-// CreateCollection creates a new Directus collection.
-//
-// Example:
-//
-//	client.CreateCollection(ctx, directus.CreateCollectionInput{
-//	    Collection: "products",
-//	    Meta:       &directus.CollectionMeta{Icon: "shopping_cart"},
-//	    Fields: []directus.FieldInput{
-//	        directus.PrimaryKeyField("id"),
-//	        {Field: "name", Type: FieldTypeString, Meta: &FieldMeta{Required: true}},
-//	        {Field: "price", Type: FieldTypeFloat},
-//	    },
-//	})
+// CreateCollection creates a new Directus collection and its fields.
 func (c *Client) CreateCollection(ctx context.Context, input CreateCollectionInput) error {
-	// Directus requires "schema" to be present (even empty) for table creation.
-	// For collection folders, schema must be explicitly null (omitted via nil pointer).
+	// Empty rather than absent: see CreateCollectionInput.Schema.
 	if input.Schema == nil && !input.isFolder {
 		input.Schema = &SchemaOptions{}
 	}
 
-	// Directus 11 quirk: fields with special metadata (date-created, date-updated, etc.)
-	// don't get their special behavior applied when created inline with the collection.
-	// Split them out and create them separately after the collection.
+	// Directus 11 quirk: fields carrying special metadata (date-created, uuid, ...)
+	// lose that behaviour when created inline, so they are created afterwards.
 	inlineFields, deferredFields := splitSpecialFields(input.Fields)
 	input.Fields = inlineFields
 
@@ -84,7 +67,6 @@ func (c *Client) CreateCollection(ctx context.Context, input CreateCollectionInp
 		return fmt.Errorf("directus: create collection %s: %w", input.Collection, err)
 	}
 
-	// Create deferred fields with special metadata separately.
 	for _, field := range deferredFields {
 		if err := c.CreateField(ctx, input.Collection, field); err != nil {
 			return fmt.Errorf("directus: create collection %s field %s: %w", input.Collection, field.Field, err)
@@ -94,8 +76,7 @@ func (c *Client) CreateCollection(ctx context.Context, input CreateCollectionInp
 	return nil
 }
 
-// splitSpecialFields separates fields that need special metadata applied
-// (must be created after the collection) from regular inline fields.
+// splitSpecialFields separates fields that must be created after the collection.
 func splitSpecialFields(fields []FieldInput) (inline, deferred []FieldInput) {
 	for _, f := range fields {
 		if f.Meta != nil && hasSpecialTag(f.Meta.Special) {
@@ -119,25 +100,8 @@ func hasSpecialTag(special []string) bool {
 	return false
 }
 
-// CreateCollectionFolder creates a virtual collection folder for organizing
-// other collections in the Directus sidebar.
-//
-// Folders have no database table — they exist only in the Directus metadata.
-// Place collections inside a folder by setting CollectionMeta.Group on those collections.
-//
-// Example:
-//
-//	// Create a folder.
-//	dc.CreateCollectionFolder(ctx, "content", &directus.CollectionMeta{
-//	    Icon: "folder", Collapse: directus.CollapseOpen,
-//	})
-//
-//	// Create a collection inside the folder.
-//	dc.CreateCollection(ctx, directus.CreateCollectionInput{
-//	    Collection: "articles",
-//	    Meta:       &directus.CollectionMeta{Icon: "article", Group: "content"},
-//	    Fields:     []directus.FieldInput{directus.PrimaryKeyField("id")},
-//	})
+// CreateCollectionFolder creates a virtual sidebar folder with no database table.
+// Collections join it by setting CollectionMeta.Group to name.
 func (c *Client) CreateCollectionFolder(ctx context.Context, name string, meta *CollectionMeta) error {
 	if meta == nil {
 		meta = &CollectionMeta{}
@@ -151,7 +115,7 @@ func (c *Client) CreateCollectionFolder(ctx context.Context, name string, meta *
 		Collection: name,
 		Meta:       meta,
 		isFolder:   true,
-		// Schema is intentionally nil — Directus interprets null schema as "no table".
+		// Schema stays nil so it serializes as null: no table.
 	}
 
 	_, err := c.Post(ctx, "collections", input)
@@ -206,30 +170,8 @@ const (
 	FieldTypeTimestamp FieldType = "timestamp"
 )
 
-// FieldMeta configures Directus-level field metadata.
-//
-// Interface and Display MUST be set for a field to appear properly in the
-// Directus Data Studio. Without them, the field shows as "Database Only".
-//
-// Common interface values:
-//   - "input" — text/number input
-//   - "input-multiline" — textarea
-//   - "boolean" — toggle switch
-//   - "select-dropdown" — dropdown select
-//   - "select-dropdown-m2o" — M2O relational dropdown with search and create
-//   - "list-m2m" — M2M relational list
-//   - "list-o2m" — O2M relational list
-//   - "datetime" — date/time picker
-//   - "input-code" — code editor (for JSON)
-//   - "tags" — tag input
-//
-// Common display values:
-//   - "formatted-value" — generic display
-//   - "related-values" — show related item field(s) for M2O
-//   - "labels" — colored labels
-//   - "boolean" — true/false display
-//   - "datetime" — formatted datetime
-//   - "raw" — raw value
+// FieldMeta configures Directus-level field metadata. The accepted Interface,
+// Display, Width and Special values are listed in docs/directus-package.md.
 type FieldMeta struct {
 	Required bool   `json:"required,omitempty"`
 	Readonly bool   `json:"readonly,omitempty"`
@@ -455,13 +397,8 @@ func JSONField(name string) FieldInput {
 	}
 }
 
-// M2OField returns a Many-to-One relational field with a dropdown selector.
-// This creates the foreign key field that shows a rich dropdown in the Directus UI
-// with search, preview, and ability to create new related items.
-//
-// Example — product belongs to a category:
-//
-//	directus.M2OField("category_id", "categories")
+// M2OField returns the foreign-key field for a Many-to-One relation, with the
+// dropdown selector configured. relatedCollection is bound by M2O, not by the field.
 func M2OField(name, relatedCollection string) FieldInput {
 	return FieldInput{
 		Field: name,
@@ -506,18 +443,14 @@ func (c *Client) DeleteField(ctx context.Context, collection, field string) erro
 	return nil
 }
 
-// CollectionField is a minimal description of a Directus field returned by
-// ListFields. Captures only what's needed for schema drift detection — name
-// plus the declared type. Use CreateField/UpdateField for the full FieldInput
-// shape.
+// CollectionField is the subset of a Directus field that ListFields returns:
+// enough for schema drift detection, not enough to recreate the field.
 type CollectionField struct {
 	Field string    `json:"field"`
 	Type  FieldType `json:"type"`
 }
 
-// ListFields returns the fields declared on a Directus collection. Used by
-// the manager's schema-drift check to compare the live Directus schema
-// against the Go struct backing a registered collection.
+// ListFields returns the fields declared on a Directus collection.
 func (c *Client) ListFields(ctx context.Context, collection string) ([]CollectionField, error) {
 	raw, err := c.Get(ctx, "fields/"+collection, nil)
 	if err != nil {
@@ -592,13 +525,8 @@ func (c *Client) GetRelations(ctx context.Context, collection string) (json.RawM
 	return raw, nil
 }
 
-// M2O creates a Many-to-One relation: many items in `collection` point to one item in `related`.
-//
-// This creates the foreign key field on the "many" side.
-//
-// Example — each product belongs to one category:
-//
-//	directus.M2O("products", "category_id", "categories")
+// M2O relates many items in collection to one item in related, via a foreign key
+// on the "many" side: M2O("products", "category_id", "categories").
 func M2O(collection, field, related string) RelationInput {
 	return RelationInput{
 		Collection: collection,
@@ -610,14 +538,8 @@ func M2O(collection, field, related string) RelationInput {
 	}
 }
 
-// O2M creates a One-to-Many relation: one item in `collection` has many items in `related`.
-//
-// aliasField is the virtual field name on the "one" side (no database column).
-// foreignKey is the actual FK field on the "many" side that must already exist.
-//
-// Example — one category has many products:
-//
-//	directus.O2M("categories", "products", "products", "category_id")
+// O2M relates one item in collection to many in related. aliasField is a virtual
+// field on the "one" side; foreignKey must already exist on the "many" side.
 func O2M(collection, aliasField, related, foreignKey string) RelationInput {
 	return RelationInput{
 		Collection: related,
@@ -649,35 +571,8 @@ type M2MInput struct {
 	AliasField string
 }
 
-// M2M creates the relation inputs needed for a Many-to-Many relationship.
-//
-// Returns two RelationInputs: one for each side of the junction.
-// You must create the junction collection and its FK fields before calling CreateRelation.
-//
-// Example — products have many tags, tags have many products:
-//
-//	// 1. Create junction collection
-//	client.CreateCollection(ctx, directus.CreateCollectionInput{
-//	    Collection: "products_tags",
-//	    Meta:       &directus.CollectionMeta{Hidden: true},
-//	    Fields: []directus.FieldInput{
-//	        directus.PrimaryKeyField("id"),
-//	        {Field: "products_id", Type: directus.FieldTypeInteger},
-//	        {Field: "tags_id", Type: directus.FieldTypeInteger},
-//	    },
-//	})
-//
-//	// 2. Create both sides of the M2M relation
-//	source, target := directus.M2M(directus.M2MInput{
-//	    Collection:          "products",
-//	    Related:             "tags",
-//	    JunctionCollection:  "products_tags",
-//	    JunctionSourceField: "products_id",
-//	    JunctionTargetField: "tags_id",
-//	    AliasField:          "tags",
-//	})
-//	client.CreateRelation(ctx, source)
-//	client.CreateRelation(ctx, target)
+// M2M builds the relation input for each side of a Many-to-Many junction. The
+// junction collection and its FK fields must already exist — see docs/directus-package.md.
 func M2M(input M2MInput) (source RelationInput, target RelationInput) {
 	source = RelationInput{
 		Collection: input.JunctionCollection,
@@ -704,40 +599,8 @@ func M2M(input M2MInput) (source RelationInput, target RelationInput) {
 	return source, target
 }
 
-// Translations creates the relation inputs for the Directus translations interface.
-//
-// This is a specialized M2M using a junction collection that stores language-specific content.
-// langCollection is the collection that stores available languages (e.g. "languages").
-// You must create this collection before calling CreateRelation.
-//
-// Example — products with translations:
-//
-//	// 1. Create languages collection
-//	client.CreateCollection(ctx, directus.CreateCollectionInput{
-//	    Collection: "languages",
-//	    Fields: []directus.FieldInput{
-//	        {Field: "code", Type: directus.FieldTypeString, Schema: &directus.FieldSchema{IsPrimaryKey: true, IsNullable: new(bool)}},
-//	        {Field: "name", Type: directus.FieldTypeString},
-//	    },
-//	})
-//
-//	// 2. Create translations junction collection
-//	client.CreateCollection(ctx, directus.CreateCollectionInput{
-//	    Collection: "products_translations",
-//	    Meta:       &directus.CollectionMeta{Hidden: true},
-//	    Fields: []directus.FieldInput{
-//	        directus.PrimaryKeyField("id"),
-//	        {Field: "products_id", Type: directus.FieldTypeInteger},
-//	        {Field: "languages_code", Type: directus.FieldTypeString},
-//	        {Field: "name", Type: directus.FieldTypeString},
-//	        {Field: "description", Type: directus.FieldTypeText},
-//	    },
-//	})
-//
-//	// 3. Create the translations relations
-//	source, lang := directus.Translations("products", "products_translations", "products_id", "languages_code", "languages")
-//	client.CreateRelation(ctx, source)
-//	client.CreateRelation(ctx, lang)
+// Translations builds the relation inputs for the Directus translations interface:
+// an M2M whose junction holds the per-language content. See docs/directus-package.md.
 func Translations(collection, junctionCollection, sourceField, langField, langCollection string) (source RelationInput, lang RelationInput) {
 	aliasField := "translations"
 	source = RelationInput{

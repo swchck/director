@@ -30,7 +30,6 @@ func TestE2E_CreateCollection(t *testing.T) {
 		t.Fatalf("create collection: %v", err)
 	}
 
-	// Verify we can write and read items.
 	type BasicItem struct {
 		ID     int    `json:"id"`
 		Name   string `json:"name"`
@@ -117,7 +116,6 @@ func TestE2E_M2ORelation(t *testing.T) {
 		cleanupCollection(t, dc, "e2e_categories")
 	})
 
-	// Create categories.
 	err := dc.CreateCollection(ctx, directus.CreateCollectionInput{
 		Collection: "e2e_categories",
 		Fields: []directus.FieldInput{
@@ -149,7 +147,6 @@ func TestE2E_M2ORelation(t *testing.T) {
 		t.Fatalf("create M2O relation: %v", err)
 	}
 
-	// Seed data.
 	type Category struct {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
@@ -181,7 +178,6 @@ func TestE2E_M2ORelation(t *testing.T) {
 		t.Fatalf("create product: %v", err)
 	}
 
-	// Fetch with M2O expanded.
 	products, err := prodItems.List(ctx, directus.WithFields("*", "category_id.*"))
 	if err != nil {
 		t.Fatalf("list products: %v", err)
@@ -207,7 +203,6 @@ func TestE2E_M2MRelation(t *testing.T) {
 		cleanupCollection(t, dc, "e2e_tags")
 	})
 
-	// Create tags.
 	err := dc.CreateCollection(ctx, directus.CreateCollectionInput{
 		Collection: "e2e_tags",
 		Fields: []directus.FieldInput{
@@ -219,7 +214,6 @@ func TestE2E_M2MRelation(t *testing.T) {
 		t.Fatalf("create tags: %v", err)
 	}
 
-	// Create articles.
 	err = dc.CreateCollection(ctx, directus.CreateCollectionInput{
 		Collection: "e2e_articles",
 		Fields: []directus.FieldInput{
@@ -264,7 +258,6 @@ func TestE2E_M2MRelation(t *testing.T) {
 		t.Fatalf("create M2M target: %v", err)
 	}
 
-	// Seed data.
 	type Tag struct {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
@@ -335,7 +328,6 @@ func TestE2E_M2MRelation(t *testing.T) {
 		t.Fatalf("junction has %d items, want 2", len(junctions))
 	}
 
-	// Verify both tags are linked.
 	linkedTagIDs := make(map[int]bool)
 	for _, j := range junctions {
 		linkedTagIDs[j.E2eTagsID] = true

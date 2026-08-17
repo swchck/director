@@ -38,7 +38,10 @@ func (s *Storage) Migrate(ctx context.Context) error {
 }
 
 // SaveSnapshot inserts a new snapshot in pending state.
-// If a snapshot with the same collection+version already exists, this is a no-op.
+//
+// Re-saving the same collection+version is a no-op rather than an error: a
+// retried cycle re-derives the same version from the same source data, so the
+// row already there is the row this would write.
 func (s *Storage) SaveSnapshot(ctx context.Context, collection, version string, content []byte) error {
 	const query = `
 		INSERT INTO director.config_snapshots (collection_name, version, content, status)
@@ -52,8 +55,8 @@ func (s *Storage) SaveSnapshot(ctx context.Context, collection, version string, 
 	return nil
 }
 
-// ActivateSnapshot marks the given snapshot as active and demotes any previously
-// active snapshot for the same collection to inactive.
+// ActivateSnapshot promotes a snapshot and demotes the previous active one in a
+// single transaction, so a collection is never left with two or zero active rows.
 func (s *Storage) ActivateSnapshot(ctx context.Context, collection, version string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -113,9 +116,8 @@ func (s *Storage) GetActiveSnapshot(ctx context.Context, collection string) (*st
 	return snap, nil
 }
 
-// GetActiveVersion returns just the version string of the active snapshot,
-// without fetching the full content. Used by followers for cheap version
-// comparison during self-heal checks.
+// GetActiveVersion returns the active snapshot's version without loading its
+// content, satisfying storage.ActiveVersionChecker.
 func (s *Storage) GetActiveVersion(ctx context.Context, collection string) (string, error) {
 	const query = `
 		SELECT version
@@ -177,7 +179,8 @@ func (s *Storage) FailSnapshot(ctx context.Context, collection, version string) 
 }
 
 // LogApply records that an instance has applied (or failed to apply) a config version.
-// Uses upsert so repeated calls are idempotent.
+// The row is upserted so an instance can overwrite its own earlier status for the
+// same version (prepared → committed) and so retries stay idempotent.
 func (s *Storage) LogApply(ctx context.Context, instanceID, collection, version, status string) error {
 	const query = `
 		INSERT INTO director.config_apply_log (instance_id, collection_name, version, status)
@@ -247,12 +250,8 @@ func (s *Storage) AppliedInstances(ctx context.Context, collection, version, sta
 	return ids, nil
 }
 
-// DeleteOldSnapshots removes snapshots created before olderThan, except those
-// in the 'active' status (which are preserved regardless of age so the
-// cluster can always recover the current authoritative version).
-//
-// In the same transaction, apply-log rows for the deleted snapshot versions
-// are removed. Returns the number of snapshots deleted.
+// DeleteOldSnapshots prunes aged-out snapshots and their apply-log rows in one
+// transaction, so a log row never outlives the snapshot it refers to.
 func (s *Storage) DeleteOldSnapshots(ctx context.Context, olderThan time.Time) (int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -307,6 +306,10 @@ func (s *Storage) DeleteOldSnapshots(ctx context.Context, olderThan time.Time) (
 // AcquireLock attempts to acquire a Postgres session-level advisory lock.
 // Returns a release function if acquired. The caller must call release when done.
 // Returns storage.ErrLockNotAcquired if the lock is already held by another session.
+//
+// The pooled connection is held for the lifetime of the lock: advisory locks are
+// scoped to a session, so handing the connection back would let the next
+// AcquireLock land on that same session and succeed — two leaders at once.
 func (s *Storage) AcquireLock(ctx context.Context, key int64) (func(), error) {
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
@@ -325,7 +328,8 @@ func (s *Storage) AcquireLock(ctx context.Context, key int64) (func(), error) {
 	}
 
 	release := func() {
-		// Best-effort unlock; connection release handles cleanup regardless.
+		// Best-effort unlock: it fails only on a session that is already broken,
+		// and Postgres frees session locks when the session ends.
 		_, _ = conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", key)
 		conn.Release()
 	}

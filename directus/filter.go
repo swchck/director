@@ -12,12 +12,8 @@ import (
 // It serializes to the JSON format expected by the Directus filter query parameter.
 type Filter map[string]any
 
-// Field creates a single-field filter: {"field": {"op": value}}.
-//
-// Example:
-//
-//	directus.Field("status", "_eq", "published")
-//	// => {"status": {"_eq": "published"}}
+// Field creates a single-field filter: Field("status", "_eq", "published")
+// serializes to {"status": {"_eq": "published"}}.
 func Field(field, op string, value any) Filter {
 	return Filter{field: map[string]any{op: value}}
 }
@@ -38,17 +34,8 @@ func Or(filters ...Filter) Filter {
 	return Filter{"_or": items}
 }
 
-// RelationQuery configures query parameters applied to a nested relational field
-// via the Directus "deep" parameter.
-//
-// This is how you filter, sort, or limit related items in M2O, O2M, M2M, and M2A
-// relationships, as well as translations.
-//
-// Example — fetch only English translations:
-//
-//	directus.WithDeep("translations", directus.RelationQuery{
-//	    Filter: directus.Field("languages_code", "_eq", "en-US"),
-//	})
+// RelationQuery filters, sorts or limits the items of one nested relational field
+// (M2O, O2M, M2M, M2A, translations) via the Directus "deep" parameter.
 type RelationQuery struct {
 	Filter Filter
 	Sort   []string
@@ -104,10 +91,6 @@ func WithFilter(f Filter) QueryOption {
 }
 
 // WithSort sets the sort order. Prefix a field with "-" for descending.
-//
-// Example:
-//
-//	directus.WithSort("-date_created", "name")
 func WithSort(fields ...string) QueryOption {
 	return func(q *queryParams) {
 		q.sort = fields
@@ -128,38 +111,16 @@ func WithOffset(n int) QueryOption {
 	}
 }
 
-// WithFields restricts the response to the specified fields.
-//
-// Use dot notation to include relational data:
-//
-//	directus.WithFields("*", "author.*")           // M2O: include the related author
-//	directus.WithFields("*", "tags.*")              // M2M: include related tags
-//	directus.WithFields("*", "translations.*")      // include all translations
-//	directus.WithFields("*", "comments.author.*")   // nested: comment authors
+// WithFields restricts the response to the given fields. Dot notation pulls in
+// relational data, at any depth: WithFields("*", "comments.author.*").
 func WithFields(fields ...string) QueryOption {
 	return func(q *queryParams) {
 		q.fields = fields
 	}
 }
 
-// WithDeep configures query parameters for a nested relational field.
-// Multiple calls to WithDeep for different relations are merged.
-//
-// This supports all Directus relation types: M2O, O2M, M2M, M2A, and translations.
-//
-// Example — filter M2M tags to only published ones:
-//
-//	directus.WithDeep("tags", directus.RelationQuery{
-//	    Filter: directus.Field("status", "_eq", "published"),
-//	    Sort:   []string{"name"},
-//	})
-//
-// Example — limit O2M comments and sort by date:
-//
-//	directus.WithDeep("comments", directus.RelationQuery{
-//	    Sort:  []string{"-date_created"},
-//	    Limit: new(int), // or use &myVar for non-zero values
-//	})
+// WithDeep applies rq to a nested relational field. Calls for distinct relations
+// merge; a repeated relation keeps the last rq.
 func WithDeep(relation string, rq RelationQuery) QueryOption {
 	return func(q *queryParams) {
 		if q.deep == nil {
@@ -170,21 +131,10 @@ func WithDeep(relation string, rq RelationQuery) QueryOption {
 	}
 }
 
-// WithTranslations is a convenience option that includes all translation fields
-// and optionally filters by language code.
-//
-// It combines WithFields("*", "translations.*") with a deep filter on the
-// specified language field.
-//
-// langField is the name of the language code field in the translations junction
-// (typically "languages_code" in Directus).
-//
-// Example:
-//
-//	directus.WithTranslations("languages_code", "en-US")
+// WithTranslations includes translations.* and keeps only langCode. langField is the
+// language column on the junction collection, conventionally "languages_code".
 func WithTranslations(langField, langCode string) QueryOption {
 	return func(q *queryParams) {
-		// Ensure translations are included in fields.
 		hasTranslations := false
 		for _, f := range q.fields {
 			if f == "translations.*" || f == "translations" {
@@ -201,7 +151,6 @@ func WithTranslations(langField, langCode string) QueryOption {
 			}
 		}
 
-		// Apply language filter via deep.
 		if q.deep == nil {
 			q.deep = make(map[string]RelationQuery)
 		}

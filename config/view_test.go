@@ -3,6 +3,7 @@ package config_test
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -533,9 +534,7 @@ func (s *slowPersistence) Load(_ context.Context, _ string) ([]byte, error) {
 	return nil, nil
 }
 
-// TestView_WithPersistenceTimeout_FiresOnSlowSave verifies that the timeout
-// configured via WithPersistenceTimeout cancels the Save context and that the
-// resulting error reaches the registered error handler.
+// The timeout must cancel the Save context and the resulting error must reach the handler.
 func TestView_WithPersistenceTimeout_FiresOnSlowSave(t *testing.T) {
 	store := newSlowPersistence()
 
@@ -594,10 +593,6 @@ func TestView_WithPersistenceTimeout_FiresOnSlowSave(t *testing.T) {
 	}
 }
 
-// TestSingletonView_WithErrorHandler_OnPersistFailure verifies that the
-// callback configured via WithSingletonViewErrorHandler is invoked when the
-// persistence Save fails. Documented in CHANGELOG: "WithSingletonViewErrorHandler
-// option for error callbacks on SingletonView persistence failures".
 func TestSingletonView_WithErrorHandler_OnPersistFailure(t *testing.T) {
 	var (
 		mu       sync.Mutex
@@ -835,4 +830,224 @@ func TestView_OnChange_HookCannotMutateSnapshot(t *testing.T) {
 	if all[0].Name != "Original" {
 		t.Errorf("hook mutated view snapshot: Name = %q, want 'Original'", all[0].Name)
 	}
+}
+
+// Warm start tests
+
+func storedItems(t *testing.T, items ...item) []byte {
+	t.Helper()
+
+	data, err := json.Marshal(items)
+	if err != nil {
+		t.Fatalf("marshal stored items: %v", err)
+	}
+
+	return data
+}
+
+func TestView_WithPersistence_WarmStart(t *testing.T) {
+	tests := []struct {
+		name       string
+		stored     []byte
+		sourceVer  config.Version
+		sourceItem []item
+		wantIDs    []int
+	}{
+		{
+			name:    "stored snapshot stands while the source is unloaded",
+			stored:  storedItems(t, item{ID: 7}, item{ID: 8}),
+			wantIDs: []int{7, 8},
+		},
+		{
+			name:       "a loaded source wins over a stale snapshot",
+			stored:     storedItems(t, item{ID: 7}),
+			sourceVer:  v1(),
+			sourceItem: []item{{ID: 1}, {ID: 2}},
+			wantIDs:    []int{1, 2},
+		},
+		{
+			name:      "a source that synced empty wins over a snapshot",
+			stored:    storedItems(t, item{ID: 7}),
+			sourceVer: v1(),
+			wantIDs:   nil,
+		},
+		{
+			name:    "no stored entry leaves the view computed from the source",
+			wantIDs: nil,
+		},
+		{
+			name:    "a stored null is not a warm start",
+			stored:  []byte("null"),
+			wantIDs: nil,
+		},
+		{
+			name:    "a stored empty snapshot is a warm start",
+			stored:  []byte("[]"),
+			wantIDs: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &mockPersistence{data: make(map[string][]byte)}
+			if tc.stored != nil {
+				store.data["warm"] = tc.stored
+			}
+
+			c := config.NewCollection[item]("items")
+			if !tc.sourceVer.IsZero() {
+				_ = c.Swap(tc.sourceVer, tc.sourceItem)
+			}
+
+			v := config.NewView("warm", c, nil, config.WithPersistence[item](store))
+
+			if got := idsOf(v.All()); !equalInts(got, tc.wantIDs) {
+				t.Errorf("All() = %v, want %v", got, tc.wantIDs)
+			}
+
+			if v.Version() != tc.sourceVer {
+				t.Errorf("Version() = %v, want %v", v.Version(), tc.sourceVer)
+			}
+		})
+	}
+}
+
+func TestView_WithPersistence_WarmStartSupersededByFirstSwap(t *testing.T) {
+	store := &mockPersistence{data: map[string][]byte{
+		"warm": storedItems(t, item{ID: 7}),
+	}}
+
+	c := config.NewCollection[item]("items")
+	v := config.NewView("warm", c, nil, config.WithPersistence[item](store))
+
+	if got := idsOf(v.All()); !equalInts(got, []int{7}) {
+		t.Fatalf("All() before first sync = %v, want [7]", got)
+	}
+
+	_ = c.Swap(v1(), []item{{ID: 1}})
+
+	if got := idsOf(v.All()); !equalInts(got, []int{1}) {
+		t.Errorf("All() after first sync = %v, want [1]", got)
+	}
+
+	if v.Version() != v1() {
+		t.Errorf("Version() = %v, want %v", v.Version(), v1())
+	}
+}
+
+// Not recomputing on a warm start is also what stops a replica that comes up before its
+// first sync from overwriting the shared snapshot with an empty one.
+func TestView_WithPersistence_ColdStartKeepsStoredSnapshot(t *testing.T) {
+	stored := storedItems(t, item{ID: 7})
+	store := &mockPersistence{data: map[string][]byte{"warm": stored}}
+
+	c := config.NewCollection[item]("items")
+	_ = config.NewView("warm", c, nil, config.WithPersistence[item](store))
+
+	// Allow any async persistence goroutine to run.
+	time.Sleep(50 * time.Millisecond)
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	if string(store.data["warm"]) != string(stored) {
+		t.Errorf("stored snapshot = %s, want it untouched (%s)", store.data["warm"], stored)
+	}
+}
+
+func TestSingletonView_WithPersistence_WarmStart(t *testing.T) {
+	tests := []struct {
+		name      string
+		stored    []byte
+		sourceVer config.Version
+		source    appConfig
+		wantVal   int
+		wantOK    bool
+	}{
+		{
+			name:    "stored value stands while the source is unloaded",
+			stored:  []byte("7"),
+			wantVal: 7,
+			wantOK:  true,
+		},
+		{
+			name:      "a loaded source wins over a stale value",
+			stored:    []byte("7"),
+			sourceVer: v1(),
+			source:    appConfig{MaxItems: 42},
+			wantVal:   42,
+			wantOK:    true,
+		},
+		{
+			name:   "no stored entry leaves the view unloaded",
+			wantOK: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &mockPersistence{data: make(map[string][]byte)}
+			if tc.stored != nil {
+				store.data["warm"] = tc.stored
+			}
+
+			s := config.NewSingleton[appConfig]("app_config")
+			if !tc.sourceVer.IsZero() {
+				_ = s.Swap(tc.sourceVer, tc.source)
+			}
+
+			sv := config.NewSingletonView("warm", s,
+				func(c appConfig) int { return c.MaxItems },
+				config.WithSingletonViewPersistence[appConfig, int](store),
+			)
+
+			val, ok := sv.Get()
+			if ok != tc.wantOK || val != tc.wantVal {
+				t.Errorf("Get() = %d, %v, want %d, %v", val, ok, tc.wantVal, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestSingletonView_WithPersistence_WarmStartSupersededByFirstSwap(t *testing.T) {
+	store := &mockPersistence{data: map[string][]byte{"warm": []byte("7")}}
+
+	s := config.NewSingleton[appConfig]("app_config")
+	sv := config.NewSingletonView("warm", s,
+		func(c appConfig) int { return c.MaxItems },
+		config.WithSingletonViewPersistence[appConfig, int](store),
+	)
+
+	if val, ok := sv.Get(); !ok || val != 7 {
+		t.Fatalf("Get() before first sync = %d, %v, want 7, true", val, ok)
+	}
+
+	_ = s.Swap(v1(), appConfig{MaxItems: 42})
+
+	if val, ok := sv.Get(); !ok || val != 42 {
+		t.Errorf("Get() after first sync = %d, %v, want 42, true", val, ok)
+	}
+}
+
+func idsOf(items []item) []int {
+	ids := make([]int, len(items))
+	for i, it := range items {
+		ids[i] = it.ID
+	}
+
+	return ids
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+
+	return true
 }

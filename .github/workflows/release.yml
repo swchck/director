@@ -28,6 +28,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
+          check-latest: true
 
       - name: Verify build
         run: go build ./...

@@ -45,7 +45,8 @@ No circular dependencies. Each package can be used independently.
 ### Poll-Based (default)
 
 1. **Manager** polls the source for `LastModified()` per collection
-2. If version changed -> fetches all items via `source.CollectionSource[T].List()`
+2. If version moved *forward* -> fetches all items via `source.CollectionSource[T].List()`
+   (an older reported version is declined — see [sync protocol](sync-protocol.md#forward-only-leader))
 3. Calls `config.Collection[T].Swap()` -> atomic pointer swap -> fires OnChange hooks
 4. OnChange hooks trigger `View[T].recompute()` -> views auto-update
 5. Snapshot saved to `storage` (Postgres)
@@ -64,15 +65,22 @@ No circular dependencies. Each package can be used independently.
 ## Startup Sequence
 
 ```
-1. Register instance in registry
-2. Load from cache (Redis/memory -- fastest, may be stale)
-3. Load from storage (Postgres active snapshot)
-4. Initial sync from source (source of truth)
-5. Subscribe to notifications + WebSocket
-6. Enter event loop: poll + heartbeat + notification + WS listener
+1. Register instance in registry and start the heartbeat goroutine
+   (it covers every step below, including the initial sync)
+2. Subscribe to notifications (before any load or sync: peers already count this
+   instance in their 2PC target set, and no transport replays a missed event)
+3. Load from cache (Redis/memory -- fastest, may be stale either way)
+4. Load from storage (Postgres active snapshot -- canonical, overrides the cache)
+5. Initial sync from source (source of truth)
+6. Subscribe to the Directus WebSocket
+7. Enter the run loop: poll + SyncNow requests + leader election /
+   follower catch-up / staged-value sweep + notification + WS listener
 ```
 
-Replicas can serve requests after step 2 or 3, before the source is contacted.
+Replicas can serve requests after step 3 or 4, before the source is contacted.
+
+Everything in step 7 that mutates config state shares one goroutine — see
+[Single-Writer Invariant](sync-protocol.md#single-writer-invariant).
 
 ## Consistency Modes
 

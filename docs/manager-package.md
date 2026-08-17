@@ -159,8 +159,8 @@ Behavior:
 - Errors are wrapped with `manager.ErrValidationFailed` for `errors.Is` matching.
 - The cluster stays on the **previous** known-good version. If no good version was ever applied (validator failed on first sync, or the persisted snapshot fails the current validator on startup), the collection stays empty until a valid version arrives.
 - WebSocket events do **not** carry payload — they trigger a re-fetch. After a rejection, the next WS event or poll cycle re-fetches the **current** source state. Once the source data is fixed, the new version is applied automatically.
-- Each `(collection, version)` failure is logged at most once. The dedup state resets on the next successful apply, so subsequent invalid versions are still surfaced.
-- `Metrics.ValidationFailed(collection)` fires on each rejection.
+- Each `(collection, version)` failure is logged at most once. The dedup state resets on the next successful apply, so subsequent invalid versions are still surfaced. Other per-version reports (a refused backward move, an aborted 2PC round) keep their own records and cannot evict this one.
+- `Metrics.ValidationFailed(collection)` fires with the log line — at most once per `(collection, version)`, not once per rejection.
 
 In `RequireUnanimousApply` (2PC) mode:
 
@@ -183,12 +183,15 @@ go func() {
 
 ### What Start does
 
-1. Registers this instance in the registry
-2. Loads from cache (if enabled)
-3. Loads from Postgres storage (active snapshots)
-4. Performs initial sync from the data source
-5. Subscribes to notification channel + WebSocket
-6. Enters event loop: poll ticker + heartbeat + notifications + WS (debounced)
+1. Registers this instance in the registry and starts the heartbeat goroutine, which covers every step below
+2. Subscribes to the notification channel — before the loads and the sync, because peers count this instance in their 2PC target set from step 1 on and no transport replays a missed event
+3. Loads from cache (if enabled)
+4. Loads from Postgres storage (active snapshots)
+5. Performs initial sync from the data source
+6. Subscribes to the Directus WebSocket
+7. Enters the run loop: poll ticker + `SyncNow` requests + leader election / follower catch-up / staged-value sweep + notifications + WS (debounced)
+
+The calling goroutine runs steps 1-6 and then the run loop, and is the only one that mutates config state — see [Single-Writer Invariant](sync-protocol.md#single-writer-invariant).
 
 ## WebSocket Integration
 
@@ -241,16 +244,18 @@ timer fires -> sync "products" ONCE -> one refetch -> one view recompute
 
 The debounce accumulates changed collections. When the timer fires, all accumulated collections are synced in one batch.
 
-## Event Loop
+## Run Loop
 
 ```mermaid
 flowchart LR
-    subgraph Event Loop
+    subgraph "Run loop (one goroutine)"
         PT["Poll ticker (5m)"] -->|syncAll| LP[leader protocol or no-op]
-        HB["Heartbeat (10s)"] --> RH[registry.Heartbeat]
+        SN["SyncNow requests (coalesced)"] -->|syncAll| LP
+        RT["Reconcile ticker (10s)"] -->|"syncAll / followerCatchUp / sweep staged"| LP
         NC[Notification channel] -->|handleEvent| EH["sync → load snapshot, Swap<br/>rollback → revert"]
         WS[WebSocket events] -->|"debounce (2s)"| FS[forced sync per collection]
     end
+    HB["Heartbeat goroutine (10s)"] --> RH[registry.Heartbeat]
 ```
 
 ## Type Erasure
@@ -262,7 +267,8 @@ type registrable interface {
     name() string
     version() config.Version
     fetchVersion(ctx) (time.Time, error)
-    fetchAndSwap(ctx, version) ([]byte, error)
+    fetchAndStage(ctx, version, roundID, ttl) ([]byte, stagedRef, error)
+    commitStaged(staged) error
     swapFromBytes(version, data) error
 }
 ```
@@ -279,16 +285,17 @@ mgr := manager.New(store, notifier, reg, manager.Options{
     ManualSyncOnly: true,
 })
 
-// Wire to an HTTP endpoint:
+// Wire to an HTTP endpoint. SyncNow returns as soon as the run loop has been
+// asked for a cycle, so the response does not wait for the sync itself.
 http.HandleFunc("/config/sync", func(w http.ResponseWriter, r *http.Request) {
     mgr.SyncNow(r.Context())
-    w.WriteHeader(http.StatusOK)
+    w.WriteHeader(http.StatusAccepted)
 })
 ```
 
 What stays active in manual mode:
 - Startup sequence: cache → storage loading (fast init with existing data)
-- **Bootstrap sync**: if cache and storage are empty (first deploy), one initial sync runs automatically so the service starts with valid config
+- **Bootstrap sync**: if cache and storage are empty (first deploy), an initial sync runs automatically so the service starts with valid config. It is retried on the reconcile tick while any config is still unloaded — a bootstrap that failed or aborted does not leave the replica without config until someone calls `SyncNow`. Retries stop as soon as every config has a version, which an empty source produces too
 - Heartbeats and instance registry
 - Notification listener (followers still receive sync events from leader)
 - Follower self-heal (catch up to manually triggered leader syncs)
@@ -302,8 +309,12 @@ What is disabled:
 ## Force Sync
 
 ```go
-mgr.SyncNow(ctx) // triggers immediate sync cycle
+mgr.SyncNow(ctx) // asks the run loop for a cycle, returns immediately
 ```
+
+`SyncNow` requests an ordinary version-checked cycle, not a *forced* one: it moves the collection only if the source reports a newer version ([Forward-Only Leader](sync-protocol.md#forward-only-leader)). Only WebSocket events force a cycle.
+
+`SyncNow` does not sync on the calling goroutine — config state is mutated only by the run loop ([Single-Writer Invariant](sync-protocol.md#single-writer-invariant)). It never blocks, its `ctx` is unused (the cycle runs under the context passed to `Start`), and concurrent calls coalesce into one pending cycle. A call made before `Start` waits in the buffer and is served when the run loop comes up, so a webhook that arrives while the manager is still starting is not lost; calls made once the manager is shutting down are dropped with a warning.
 
 ## Shutdown
 
@@ -335,7 +346,7 @@ On shutdown, the manager deregisters from the instance registry.
 | `WithCache(cache, strategy)` | Enable caching with a specific strategy |
 | `WithInstanceID(id)` | Override auto-generated UUID instance ID |
 | `WithWebSocket(ws)` | Enable real-time change detection |
-| `WithMetrics(m)` | Receive observability events |
+| `WithMetrics(m)` | Receive observability events; also leadership transitions when `m` implements the optional `LeadershipMetrics`, and declined source regressions when it implements `SourceMetrics` |
 
 ### Per-Registration Options
 

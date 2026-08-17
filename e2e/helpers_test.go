@@ -39,12 +39,11 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
-// adminSetupOnce ensures GrantAdminAccess runs exactly once per test process.
 var adminSetupOnce sync.Once
 
-// ensureAdminAccess uses the static token (which can access /policies in Directus 11)
-// to set admin_access=true on the Administrator policy via the ACL API.
-// This replaces the old init sidecar/DB hack approach.
+// ensureAdminAccess sets admin_access=true on the Administrator policy, once per
+// test process. The static token can reach /policies in Directus 11 even without
+// admin_access, which is what makes bootstrapping through the API possible.
 func ensureAdminAccess(t *testing.T) {
 	t.Helper()
 
@@ -52,7 +51,6 @@ func ensureAdminAccess(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		// The static token can access the policies endpoint even without admin_access.
 		staticClient := directus.NewClient(testDirectusURL, testStaticToken)
 
 		if err := staticClient.GrantAdminAccess(ctx); err != nil {
@@ -61,7 +59,7 @@ func ensureAdminAccess(t *testing.T) {
 	})
 }
 
-// getAdminJWT logs into Directus and returns a fresh JWT with admin_access.
+// getAdminJWT logs into Directus and returns a fresh JWT carrying admin_access.
 func getAdminJWT(t *testing.T) string {
 	t.Helper()
 
@@ -98,13 +96,13 @@ func testLogger(t *testing.T) dlog.Logger {
 	return dlog.NewSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 }
 
+// testDirectusClient returns a client authenticated with a login token, not the
+// static one: a Directus 11 static token does not pick up policy changes made
+// after it was issued, so it would never see the admin_access granted above.
 func testDirectusClient(t *testing.T) *directus.Client {
 	t.Helper()
 
-	// Ensure admin policy has admin_access=true.
 	ensureAdminAccess(t)
-
-	// Get a fresh JWT that includes the updated admin_access claim.
 	token := getAdminJWT(t)
 
 	return directus.NewClient(testDirectusURL, token,
@@ -134,7 +132,8 @@ func testRedisClient(t *testing.T) *redis.Client {
 	return rdb
 }
 
-// cleanupCollection deletes a collection and ignores "not found" errors.
+// cleanupCollection deletes a collection, ignoring every error: teardown must not
+// fail a test that already passed, and the collection may never have been created.
 func cleanupCollection(t *testing.T, dc *directus.Client, name string) {
 	t.Helper()
 

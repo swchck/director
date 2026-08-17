@@ -61,7 +61,8 @@ func (a *MyAPI) List(ctx context.Context) ([]Product, error) {
 }
 
 func (a *MyAPI) LastModified(ctx context.Context) (time.Time, error) {
-    // Return latest change timestamp, or time.Time{} to always refetch.
+    // Return latest change timestamp. time.Time{} means "unknown", and polling
+    // then cannot detect changes — see source.CollectionSource.
 }
 
 // Register with the manager — everything else works the same.
@@ -238,6 +239,7 @@ task down         # stop services
 
 - [Architecture Overview](docs/architecture.md)
 - [Sync Protocol](docs/sync-protocol.md)
+- [Runbook: rolling a collection back](docs/rollback-runbook.md)
 - [directus/ package](docs/directus-package.md)
 - [config/ package](docs/config-package.md)
 - [cache/ package](docs/cache-package.md)

@@ -15,19 +15,19 @@ var (
 type Strategy int
 
 const (
-	// ReadThrough checks the cache before hitting Directus.
-	// On a cache miss, the data is fetched from Directus and then stored in cache.
-	// Useful for fast cold starts and Directus unavailability.
+	// ReadThrough checks the cache before hitting the source.
+	// On a cache miss, the data is fetched from the source and then stored in cache.
+	// Useful for fast cold starts and while the source is unavailable.
 	ReadThrough Strategy = iota
 
 	// WriteThrough writes to the cache synchronously after every successful
-	// Directus fetch, before the sync is considered complete.
+	// source fetch, before the sync is considered complete.
 	// Guarantees cache consistency at the cost of slightly slower syncs.
 	WriteThrough
 
 	// WriteBehind writes to the cache asynchronously after a successful
-	// Directus fetch. The sync completes without waiting for the cache write.
-	// Better sync latency but cache may be briefly stale on failures.
+	// source fetch. The sync completes without waiting for the cache write.
+	// Better sync latency, but a failed write leaves the cache stale.
 	WriteBehind
 
 	// ReadWriteThrough combines ReadThrough and WriteThrough.
@@ -77,7 +77,9 @@ type Entry struct {
 // Cache defines the interface for an optional caching layer.
 //
 // The manager uses Cache to speed up cold starts (read from cache instead of
-// waiting for Directus) and to survive brief Directus outages.
+// waiting for the source) and to survive brief source outages. A cached entry can
+// name any version, including one the cluster has rolled back from, so the active
+// snapshot in storage overrides it at startup.
 type Cache interface {
 	// Get retrieves a cached snapshot for the given collection.
 	// Returns ErrCacheMiss if not found or expired.

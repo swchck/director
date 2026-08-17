@@ -479,72 +479,130 @@ func TestTranslatedView_Version_MatchesSource(t *testing.T) {
 	}
 }
 
+type warmProduct struct {
+	ID   int
+	Name string
+}
+
 func TestTranslatedView_WithPersistence_WarmStart(t *testing.T) {
-	type product struct {
-		ID   int
-		Name string
-	}
-	type localized struct {
-		ID   int
-		Name string
+	cached, err := json.Marshal([]warmProduct{{ID: 99, Name: "Cached"}})
+	if err != nil {
+		t.Fatalf("marshal stored items: %v", err)
 	}
 
-	store := &mockPersistence{data: make(map[string][]byte)}
+	tests := []struct {
+		name      string
+		stored    []byte
+		sourceVer config.Version
+		source    []warmProduct
+		wantNames []string
+	}{
+		{
+			name:      "stored snapshot stands while the source is unloaded",
+			stored:    cached,
+			wantNames: []string{"Cached"},
+		},
+		{
+			name:      "a loaded source wins over a stale snapshot",
+			stored:    cached,
+			sourceVer: v1(),
+			source:    []warmProduct{{ID: 1, Name: "Fresh"}},
+			wantNames: []string{"Fresh"},
+		},
+		{
+			name:      "a source that synced empty wins over a snapshot",
+			stored:    cached,
+			sourceVer: v1(),
+			wantNames: nil,
+		},
+		{
+			name:      "no stored entry leaves the view computed from the source",
+			wantNames: nil,
+		},
+		{
+			name:      "a stored null is not a warm start",
+			stored:    []byte("null"),
+			wantNames: nil,
+		},
+	}
 
-	// Pre-populate persistence with cached data.
-	cached, _ := json.Marshal([]localized{{ID: 99, Name: "Cached"}})
-	store.data["products-loc"] = cached
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &mockPersistence{data: make(map[string][]byte)}
+			if tc.stored != nil {
+				store.data["products-loc"] = tc.stored
+			}
 
-	// Source is empty — but persistence has data.
-	c := config.NewCollection[product]("products")
+			c := config.NewCollection[warmProduct]("products")
+			if !tc.sourceVer.IsZero() {
+				_ = c.Swap(tc.sourceVer, tc.source)
+			}
 
-	tv := config.NewTranslatedView("products-loc", c,
-		func(p product) localized { return localized(p) },
-		config.WithTranslatedViewPersistence[product, localized](store),
-	)
+			tv := config.NewTranslatedView("products-loc", c,
+				func(p warmProduct) warmProduct { return p },
+				config.WithTranslatedViewPersistence[warmProduct, warmProduct](store),
+			)
 
-	// After constructor: source is empty → transform produces empty → overwrites warm start.
-	// This is expected: warm start is only useful until the first real sync.
-	// The warm start data is visible between loadFromPersistence and the initial compute.
-	// In production, source.All() returns real data, so the warm start is overwritten.
-	if tv.Count() != 0 {
-		t.Errorf("Count() = %d, want 0 (source is empty, transform overwrites warm start)", tv.Count())
+			all := tv.All()
+			got := make([]string, len(all))
+
+			for i, p := range all {
+				got[i] = p.Name
+			}
+
+			if !equalStrings(got, tc.wantNames) {
+				t.Errorf("All() names = %v, want %v", got, tc.wantNames)
+			}
+
+			if tv.Version() != tc.sourceVer {
+				t.Errorf("Version() = %v, want %v", tv.Version(), tc.sourceVer)
+			}
+		})
 	}
 }
 
-func TestTranslatedView_WithPersistence_WarmStartWithData(t *testing.T) {
-	type product struct {
-		ID   int
-		Name string
-	}
-	type localized struct {
-		ID   int
-		Name string
+func TestTranslatedView_WithPersistence_WarmStartSupersededByFirstSwap(t *testing.T) {
+	cached, err := json.Marshal([]warmProduct{{ID: 99, Name: "Cached"}})
+	if err != nil {
+		t.Fatalf("marshal stored items: %v", err)
 	}
 
-	store := &mockPersistence{data: make(map[string][]byte)}
+	store := &mockPersistence{data: map[string][]byte{"products-loc": cached}}
 
-	// Pre-populate persistence.
-	cached, _ := json.Marshal([]localized{{ID: 1, Name: "Old"}})
-	store.data["products-loc"] = cached
-
-	// Source has data — persistence value should be overwritten by transform.
-	c := config.NewCollection[product]("products")
-	_ = c.Swap(v1(), []product{{ID: 1, Name: "Fresh"}})
-
+	c := config.NewCollection[warmProduct]("products")
 	tv := config.NewTranslatedView("products-loc", c,
-		func(p product) localized { return localized(p) },
-		config.WithTranslatedViewPersistence[product, localized](store),
+		func(p warmProduct) warmProduct { return p },
+		config.WithTranslatedViewPersistence[warmProduct, warmProduct](store),
 	)
 
-	if tv.Count() != 1 {
-		t.Fatalf("Count() = %d, want 1", tv.Count())
+	if first, ok := tv.First(); !ok || first.Name != "Cached" {
+		t.Fatalf("First() before first sync = %+v, %v, want Cached", first, ok)
 	}
 
-	item, ok := tv.First()
-	if !ok || item.Name != "Fresh" {
-		t.Errorf("First() = %+v, want {ID:1, Name:Fresh}", item)
+	_ = c.Swap(v1(), []warmProduct{{ID: 1, Name: "Fresh"}})
+
+	first, ok := tv.First()
+	if !ok || first.Name != "Fresh" {
+		t.Errorf("First() after first sync = %+v, %v, want Fresh", first, ok)
 	}
+
+	if tv.Version() != v1() {
+		t.Errorf("Version() = %v, want %v", tv.Version(), v1())
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+
+	return true
 }
 
 func TestTranslatedView_WithErrorHandler_OnPersistFailure(t *testing.T) {

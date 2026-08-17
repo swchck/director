@@ -99,7 +99,8 @@ func (c *Channel) Subscribe(ctx context.Context) (<-chan notify.Event, error) {
 
 	pubsub := c.client.Subscribe(subCtx, c.channel)
 
-	// Wait for confirmation that subscription is active.
+	// Block until Redis confirms the subscription, so an event published as soon
+	// as Subscribe returns is not published into the void.
 	if _, err := pubsub.Receive(subCtx); err != nil {
 		cancel()
 		_ = pubsub.Close()
@@ -131,6 +132,9 @@ func (c *Channel) Subscribe(ctx context.Context) (<-chan notify.Event, error) {
 					continue
 				}
 
+				// Blocking send, unlike notify/postgres: back-pressure stalls this
+				// reader and go-redis drops from its own buffer instead. Either way
+				// events can be lost — see docs/sync-protocol.md.
 				select {
 				case ch <- event:
 				case <-subCtx.Done():

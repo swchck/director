@@ -13,7 +13,8 @@ type AuthResponse struct {
 	RefreshToken string `json:"refresh_token"`
 }
 
-// Login authenticates with email and password, returning tokens.
+// Login authenticates with email and password, returning tokens. Prefer it for admin
+// work: a static token does not pick up policy changes made after it was issued.
 func (c *Client) Login(ctx context.Context, email, password string) (*AuthResponse, error) {
 	raw, err := c.Post(ctx, "auth/login", map[string]string{
 		"email":    email,

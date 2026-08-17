@@ -19,19 +19,39 @@ import (
 // during the 2PC prepare phase, so the round must abort.
 var errPrepareFailed = errors.New("manager: prepare phase failed")
 
-// syncAll runs one sync cycle for all registered configs.
-// If this instance holds the advisory lock, it acts as leader; otherwise follower.
-// Returns true if this instance acted as leader.
+// ErrActiveSnapshotBehind reports that a follower refused an active snapshot naming
+// an older version than it holds. Surfaced via Metrics.FollowerFailed, so alertable.
+var ErrActiveSnapshotBehind = errors.New("manager: active snapshot is behind the local version")
+
+// Dedup kinds for the per-version report slots on a registration. Distinct
+// values because the conditions are independent and must not silence each other.
+const (
+	activeRegressionKind = "active_regression"
+	sourceRegressionKind = "source_regression"
+)
+
+// Names for the code path that refused a backward move, logged as "path".
+const (
+	pathCatchUp   = "catch_up"
+	pathSyncEvent = "sync_event"
+)
+
+// rollbackApplyStatus is written to the apply log by every replica that applies
+// an operator rollback, so the rollback can be verified with one query.
+const rollbackApplyStatus = "rolled_back"
+
+// syncAll runs one sync cycle for all registered configs, as leader if this instance
+// holds the advisory lock. Reports whether it acted as leader.
 func (m *Manager) syncAll(ctx context.Context) bool {
 	prevLeader := m.isLeader.Load()
 
 	release, err := m.storage.AcquireLock(ctx, m.opts.AdvisoryLockKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrLockNotAcquired) {
-			// Another instance is leader — nothing to do, follower reacts to notifications.
+			// Another instance is leader; this one reacts to its notifications.
 			m.isLeader.Store(false)
 			if prevLeader {
-				m.metrics.LeaderLost(m.opts.ServiceName)
+				m.leaderMetrics.LeaderLost(m.opts.ServiceName)
 			}
 			return false
 		}
@@ -39,13 +59,13 @@ func (m *Manager) syncAll(ctx context.Context) bool {
 		m.logger.Error("manager: acquire lock failed", dlog.Err(err))
 		m.isLeader.Store(false)
 		if prevLeader {
-			m.metrics.LeaderLost(m.opts.ServiceName)
+			m.leaderMetrics.LeaderLost(m.opts.ServiceName)
 		}
 		return false
 	}
 	m.isLeader.Store(true)
 	if !prevLeader {
-		m.metrics.LeaderAcquired(m.opts.ServiceName)
+		m.leaderMetrics.LeaderAcquired(m.opts.ServiceName)
 	}
 	defer release()
 
@@ -55,9 +75,8 @@ func (m *Manager) syncAll(ctx context.Context) bool {
 		if err != nil {
 			m.metrics.SyncFailed(reg.name(), err)
 			if errors.Is(err, ErrValidationFailed) {
-				// reg.fetchAndSwap / fetchAndStage already deduped + warn-logged
-				// via reportFailure; suppress the generic "leader sync failed"
-				// noise so polling on a chronically-bad version doesn't spam.
+				// fetchAndStage already deduped and warn-logged this; suppress
+				// the generic error so a chronically-bad version cannot spam.
 				continue
 			}
 			m.logger.Error("manager: leader sync failed", dlog.Err(err), dlog.String("collection", reg.name()))
@@ -67,18 +86,14 @@ func (m *Manager) syncAll(ctx context.Context) bool {
 	return true
 }
 
-// followerCatchUp checks each collection's active snapshot version and applies
-// it if the local version is behind. This catches notifications lost due to
-// connection drops, Redis failover, or buffer overflow.
-//
-// The method uses ActiveVersionChecker (if the storage supports it) for a
-// cheap version-only query, falling back to GetActiveSnapshot otherwise.
+// followerCatchUp applies the active snapshot wherever the local version is behind,
+// repairing a lost notification. Forward only — see allowForward.
 func (m *Manager) followerCatchUp(ctx context.Context) {
 	for _, reg := range m.configs {
 		activeVersion, err := m.getActiveVersion(ctx, reg.name())
 		if err != nil {
 			if errors.Is(err, storage.ErrSnapshotNotFound) {
-				continue // no active snapshot yet
+				continue
 			}
 			m.logger.Error("manager: follower catch-up version check",
 				dlog.Err(err), dlog.String("collection", reg.name()))
@@ -91,7 +106,13 @@ func (m *Manager) followerCatchUp(ctx context.Context) {
 		}
 
 		if reg.version().Equal(parsedVersion) {
-			continue // already up to date
+			continue
+		}
+
+		// Checked before the content read so a stale active version costs one
+		// version query per tick.
+		if !m.allowForward(reg, parsedVersion, pathCatchUp) {
+			continue
 		}
 
 		m.logger.Info("manager: follower catch-up detected stale version",
@@ -112,6 +133,11 @@ func (m *Manager) followerCatchUp(ctx context.Context) {
 			continue
 		}
 
+		// Two separate queries, so re-check what is actually about to be applied.
+		if !m.allowForward(reg, version, pathCatchUp) {
+			continue
+		}
+
 		if err := reg.swapFromBytes(version, snap.Content); err != nil {
 			m.logger.Error("manager: follower catch-up swap",
 				dlog.Err(err), dlog.String("collection", reg.name()))
@@ -128,9 +154,73 @@ func (m *Manager) followerCatchUp(ctx context.Context) {
 	}
 }
 
-// getActiveVersion returns the active snapshot version for a collection.
-// Uses the cheap ActiveVersionChecker interface if the storage supports it,
-// otherwise falls back to GetActiveSnapshot (which loads full content).
+// allowForward reports whether a follower path may move reg onto ver — forward only,
+// but a zero local version always passes. docs/sync-protocol.md "Follower Catch-Up".
+func (m *Manager) allowForward(reg registrable, ver config.Version, path string) bool {
+	local := reg.version()
+	if local.IsZero() || ver.After(local) {
+		return true
+	}
+
+	m.metrics.FollowerFailed(reg.name(), ErrActiveSnapshotBehind)
+
+	fields := []dlog.Field{
+		dlog.String("collection", reg.name()),
+		dlog.String("local", local.String()),
+		dlog.String("active", ver.String()),
+		dlog.String("path", path),
+	}
+
+	// One warn per active version: the condition persists across reconcile ticks.
+	// The metric above is deliberately not deduped — it is the alerting signal.
+	if reg.shouldReport(ver, activeRegressionKind) {
+		m.logger.Warn("manager: refusing to move to an older active version", fields...)
+	} else {
+		m.logger.Debug("manager: refusing to move to an older active version (dedup)", fields...)
+	}
+
+	return false
+}
+
+// syncVersion resolves the version a leader cycle moves to: a forced cycle mints one
+// from the clock rather than move backwards, since the content is new either way.
+func syncVersion(reported time.Time, local config.Version, force bool) config.Version {
+	ver := config.NewVersion(reported)
+	if force && !ver.After(local) {
+		return config.NewVersion(time.Now().UTC())
+	}
+
+	return ver
+}
+
+// allowLeaderAdvance reports whether a leader cycle may move reg onto ver — forward
+// only, zero local excepted. docs/sync-protocol.md "Forward-Only Leader".
+func (m *Manager) allowLeaderAdvance(reg registrable, ver config.Version) bool {
+	local := reg.version()
+	if local.IsZero() || ver.After(local) {
+		return true
+	}
+
+	m.sourceMetrics.SourceVersionRegressed(reg.name())
+
+	fields := []dlog.Field{
+		dlog.String("collection", reg.name()),
+		dlog.String("local", local.String()),
+		dlog.String("reported", ver.String()),
+	}
+
+	// One warn per reported version: an unchanged source repeats it every poll.
+	if reg.shouldReport(ver, sourceRegressionKind) {
+		m.logger.Warn("manager: declining to sync a source version behind the one held", fields...)
+	} else {
+		m.logger.Debug("manager: declining to sync a source version behind the one held (dedup)", fields...)
+	}
+
+	return false
+}
+
+// getActiveVersion returns the active snapshot version, via the cheap
+// ActiveVersionChecker when storage implements it, else a full snapshot load.
 func (m *Manager) getActiveVersion(ctx context.Context, collection string) (string, error) {
 	if vc, ok := m.storage.(storage.ActiveVersionChecker); ok {
 		return vc.GetActiveVersion(ctx, collection)
@@ -144,9 +234,8 @@ func (m *Manager) getActiveVersion(ctx context.Context, collection string) (stri
 	return snap.Version, nil
 }
 
-// runMaintenance is invoked by the maintenance ticker. Only the leader
-// (advisory-lock holder) actually performs deletions to avoid stampedes.
-// Followers see ErrLockNotAcquired and do nothing.
+// runMaintenance deletes data past the retentions. Leader only, so followers do not
+// stampede the same deletes — they see ErrLockNotAcquired and stop.
 func (m *Manager) runMaintenance(ctx context.Context) {
 	if m.opts.SnapshotRetention <= 0 && m.opts.InstanceRetention <= 0 {
 		return
@@ -155,7 +244,7 @@ func (m *Manager) runMaintenance(ctx context.Context) {
 	release, err := m.storage.AcquireLock(ctx, m.opts.AdvisoryLockKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrLockNotAcquired) {
-			return // someone else is leader; they'll run maintenance.
+			return
 		}
 		m.logger.Error("manager: maintenance acquire lock", dlog.Err(err))
 		return
@@ -197,11 +286,8 @@ func (m *Manager) runMaintenance(ctx context.Context) {
 	}
 }
 
-// leaderSync performs the full leader sync protocol for a single config.
-// When force is true (e.g. triggered by WebSocket), the version check is skipped
-// and zero timestamps fall back to time.Now().
-//
-// Dispatches to leaderSync2PC when Options.RequireUnanimousApply is set.
+// leaderSync runs the leader protocol for one config; force skips the version check
+// (see syncVersion). Dispatches to leaderSync2PC under RequireUnanimousApply.
 func (m *Manager) leaderSync(ctx context.Context, reg registrable, force bool) error {
 	if m.opts.RequireUnanimousApply {
 		return m.leaderSync2PC(ctx, reg, force)
@@ -216,12 +302,8 @@ func (m *Manager) leaderSync(ctx context.Context, reg registrable, force bool) e
 		return fmt.Errorf("fetch version: %w", err)
 	}
 
-	if force && updatedAt.IsZero() {
-		updatedAt = time.Now().UTC()
-	}
-
-	newVersion := config.NewVersion(updatedAt)
 	currentVersion := reg.version()
+	newVersion := syncVersion(updatedAt, currentVersion, force)
 
 	if !force && !currentVersion.IsZero() && newVersion.Equal(currentVersion) {
 		m.repairCacheEntry(ctx, collection)
@@ -229,7 +311,11 @@ func (m *Manager) leaderSync(ctx context.Context, reg registrable, force bool) e
 			dlog.String("collection", collection),
 			dlog.String("version", currentVersion.String()),
 		)
-		return nil // no change
+		return nil
+	}
+
+	if !m.allowLeaderAdvance(reg, newVersion) {
+		return nil
 	}
 
 	m.logger.Info("manager: version change detected",
@@ -239,78 +325,99 @@ func (m *Manager) leaderSync(ctx context.Context, reg registrable, force bool) e
 		dlog.Bool("forced", force),
 	)
 
-	// 2. Fetch all items and swap locally.
-	content, err := reg.fetchAndSwap(ctx, newVersion)
+	version := newVersion.String()
+
+	// 2. Fetch and stage without applying: the in-memory version must not run ahead
+	// of the active snapshot. TTL 0 — only this function commits or drops it.
+	content, staged, err := reg.fetchAndStage(ctx, newVersion, uuid.NewString(), 0)
 	if err != nil {
-		return fmt.Errorf("fetch and swap: %w", err)
+		return fmt.Errorf("fetch and stage: %w", err)
 	}
 
-	m.logger.Debug("manager: fetched and swapped data",
+	m.logger.Debug("manager: fetched and staged data",
 		dlog.String("collection", collection),
 		dlog.Int("content_bytes", len(content)),
-		dlog.String("version", newVersion.String()),
+		dlog.String("version", version),
 	)
 
 	// 3. Save snapshot to storage.
-	if err := m.storage.SaveSnapshot(ctx, collection, newVersion.String(), content); err != nil {
+	if err := m.storage.SaveSnapshot(ctx, collection, version, content); err != nil {
+		reg.abortStaged(staged)
 		return fmt.Errorf("save snapshot: %w", err)
 	}
 
-	// 4. Write to cache if strategy requires it.
-	m.cacheWrite(ctx, collection, newVersion.String(), content)
+	// 4. Activate before announcing or applying: replicas reconcile against the
+	// active snapshot, so a newer in-memory version would stall the collection.
+	if err := m.storage.ActivateSnapshot(ctx, collection, version); err != nil {
+		reg.abortStaged(staged)
+		return fmt.Errorf("activate snapshot: %w", err)
+	}
 
-	// 5. Log own apply.
-	if err := m.storage.LogApply(ctx, m.instanceID, collection, newVersion.String(), "applied"); err != nil {
-		return fmt.Errorf("log apply: %w", err)
+	// 5. Apply locally.
+	if err := m.applyStaged(reg, staged, newVersion); err != nil {
+		return fmt.Errorf("apply staged value: %w", err)
 	}
 
 	// 6. Notify other replicas.
 	event := notify.Event{
-		Action:     "sync",
+		Action:     notify.ActionSync,
 		Collection: collection,
-		Version:    newVersion.String(),
+		Version:    version,
 	}
 
-	if err := m.notifier.Publish(ctx, event); err != nil {
+	if err := m.publish(ctx, event); err != nil {
 		return fmt.Errorf("publish sync event: %w", err)
 	}
 
-	// 7. Wait for confirmations from other replicas.
-	if err := m.waitConfirmations(ctx, collection, newVersion.String()); err != nil {
-		m.logger.Warn("manager: confirmations timed out, activating anyway", dlog.Err(err), dlog.String("collection", collection))
-	}
+	// 7. Write to cache if strategy requires it.
+	m.cacheWrite(ctx, collection, version, content)
 
-	// 8. Activate snapshot.
-	if err := m.storage.ActivateSnapshot(ctx, collection, newVersion.String()); err != nil {
-		return fmt.Errorf("activate snapshot: %w", err)
+	// 8. Log own apply. The value is live and the announcement is out, so a failed
+	// write loses a diagnostic row, not the sync — as in the 2PC path.
+	m.logApplyStatus(ctx, collection, version, "applied")
+
+	// 9. Wait for confirmations from other replicas. Observational only — the
+	// snapshot is already active, so a laggard delays a log line, not the cluster.
+	if err := m.waitConfirmations(ctx, collection, version); err != nil {
+		m.logger.Warn("manager: confirmations timed out", dlog.Err(err), dlog.String("collection", collection))
 	}
 
 	m.metrics.SyncCompleted(collection, time.Since(syncStart), len(content))
 
 	m.logger.Info("manager: sync complete",
 		dlog.String("collection", collection),
-		dlog.String("version", newVersion.String()),
+		dlog.String("version", version),
 	)
 
 	return nil
 }
 
-// repairCacheEntry writes the active snapshot of one collection to cache if
-// the cache entry is missing. The caller MUST hold the advisory lock so the
-// "only the leader writes to cache" invariant is preserved: the lock holder
-// is, for the duration of this call, the leader. The bytes come from the
-// storage active snapshot — the canonical source — so they cannot drift
-// from what followers would observe by reading storage directly.
-//
-// No-op when the cache is disabled, the strategy doesn't write to cache, the
-// entry is already warm, or the active snapshot is missing/unreachable.
+// applyStaged swaps a staged value into memory once the move is durable. config.Swap
+// publishes before running hooks, so ver already live means only a hook failed.
+func (m *Manager) applyStaged(reg registrable, staged stagedRef, ver config.Version) error {
+	err := reg.commitStaged(staged)
+	if err == nil || !reg.version().Equal(ver) {
+		return err
+	}
+
+	m.logger.Warn("manager: on-change hook failed after the value was applied",
+		dlog.Err(err),
+		dlog.String("collection", reg.name()),
+		dlog.String("version", ver.String()),
+	)
+
+	return nil
+}
+
+// repairCacheEntry writes the active snapshot to cache when the entry is missing. A
+// wrong-version entry is left to loadFromStorage, which overrides the cache anyway.
 func (m *Manager) repairCacheEntry(ctx context.Context, collection string) {
 	if m.cache == nil || !m.cacheStrategy.WritesToCache() {
 		return
 	}
 
 	if _, err := m.cache.Get(ctx, collection); err == nil {
-		return // already warm
+		return
 	} else if !errors.Is(err, cache.ErrCacheMiss) {
 		m.logger.Warn("manager: cache repair read failed",
 			dlog.Err(err), dlog.String("collection", collection))
@@ -333,11 +440,8 @@ func (m *Manager) repairCacheEntry(ctx context.Context, collection string) {
 	)
 }
 
-// warmCacheIfMissing acquires the advisory lock and writes any cold cache
-// entries from active snapshots in storage. Used during startup in
-// ManualSyncOnly mode where the version-skip path of leaderSync would not
-// otherwise run. If another instance holds the lock, this is a no-op — that
-// instance will repair on its own startup or next poll cycle.
+// warmCacheIfMissing warms cold cache entries from storage under the advisory lock,
+// for ManualSyncOnly startup where leaderSync's version-skip repair never runs.
 func (m *Manager) warmCacheIfMissing(ctx context.Context) {
 	if m.cache == nil || !m.cacheStrategy.WritesToCache() {
 		return
@@ -415,8 +519,27 @@ func (m *Manager) waitConfirmations(ctx context.Context, collection, version str
 	}
 }
 
-// handleEvent processes an incoming notification as a follower.
+// publish stamps this instance's ID and broadcasts. Every publish site must go
+// through here — the stamp is what lets handleEvent drop the echoed copy.
+func (m *Manager) publish(ctx context.Context, event notify.Event) error {
+	event.InstanceID = m.instanceID
+
+	return m.notifier.Publish(ctx, event)
+}
+
+// handleEvent runs the follower path for an incoming notification, dropping our own
+// (transports echo them) but not unstamped ones: docs/sync-protocol.md "Event Origin".
 func (m *Manager) handleEvent(ctx context.Context, event notify.Event) {
+	if event.InstanceID != "" && event.InstanceID == m.instanceID {
+		m.logger.Debug("manager: dropping self-published event",
+			dlog.String("action", event.Action),
+			dlog.String("collection", event.Collection),
+			dlog.String("version", event.Version),
+			dlog.String("round_id", event.RoundID),
+		)
+		return
+	}
+
 	m.logger.Debug("manager: received notify event",
 		dlog.String("action", event.Action),
 		dlog.String("collection", event.Collection),
@@ -459,8 +582,13 @@ func (m *Manager) handleSyncEvent(ctx context.Context, event notify.Event) {
 		return
 	}
 
-	// Skip if already at this version.
 	if reg.version().Equal(version) {
+		return
+	}
+
+	// Defence in depth: a leader cannot announce a regression, but this is the
+	// path that would split the cluster if one ever escaped.
+	if !m.allowForward(reg, version, pathSyncEvent) {
 		return
 	}
 
@@ -502,7 +630,8 @@ func (m *Manager) handleSyncEvent(ctx context.Context, event notify.Event) {
 	)
 }
 
-// handleRollbackEvent loads the current active snapshot and reverts to it.
+// handleRollbackEvent applies the active snapshot in either direction — the only path
+// that moves a replica backwards, hence the Warn. Procedure: docs/rollback-runbook.md.
 func (m *Manager) handleRollbackEvent(ctx context.Context, event notify.Event) {
 	reg, ok := m.configs[event.Collection]
 	if !ok {
@@ -524,6 +653,8 @@ func (m *Manager) handleRollbackEvent(ctx context.Context, event notify.Event) {
 		return
 	}
 
+	local := reg.version()
+
 	if err := reg.swapFromBytes(version, snap.Content); err != nil {
 		m.logger.Error("manager: rollback swap",
 			dlog.Err(err),
@@ -533,9 +664,17 @@ func (m *Manager) handleRollbackEvent(ctx context.Context, event notify.Event) {
 		return
 	}
 
-	m.logger.Info("manager: rolled back to active snapshot",
+	// The cache still names the version rolled back from, and repairCacheEntry needs
+	// the lock the operator holds. Safe unlocked: every replica writes these bytes.
+	m.cacheWrite(ctx, event.Collection, snap.Version, snap.Content)
+
+	m.logApplyStatus(ctx, event.Collection, snap.Version, rollbackApplyStatus)
+
+	m.logger.Warn("manager: operator rollback applied to the active snapshot",
 		dlog.String("collection", event.Collection),
-		dlog.String("version", snap.Version),
+		dlog.String("from", local.String()),
+		dlog.String("to", snap.Version),
+		dlog.Bool("backwards", !version.After(local)),
 	)
 }
 
@@ -598,8 +737,9 @@ func (m *Manager) loadFromStorage(ctx context.Context) {
 			continue
 		}
 
-		// Skip if already loaded (e.g. from cache) with a newer version.
-		if !reg.version().IsZero() && !version.After(reg.version()) {
+		// Storage is canonical and overrides the cache in either direction; nothing
+		// else repairs a cache naming a rolled-back-from version. No snapshot, no swap.
+		if reg.version().Equal(version) {
 			continue
 		}
 
@@ -635,9 +775,8 @@ func (m *Manager) handleWSChange(ctx context.Context, change directus.ChangeEven
 	m.syncOneForced(ctx, reg)
 }
 
-// syncOneForced runs the leader sync protocol skipping the version check.
-// Used by the WS handler: the WebSocket already told us something changed,
-// so we skip the version comparison and always do a full fetch.
+// syncOneForced runs the leader sync protocol for one config, skipping the
+// version check — the WebSocket event already confirmed a change.
 func (m *Manager) syncOneForced(ctx context.Context, reg registrable) {
 	release, err := m.storage.AcquireLock(ctx, m.opts.AdvisoryLockKey)
 	if err != nil {
@@ -677,10 +816,83 @@ const (
 	applyStatusCommitted     = "committed"
 )
 
-// leaderSync2PC runs the strict two-phase-commit protocol for one config.
-// Enabled via Options.RequireUnanimousApply. Either all alive replicas
-// transition to the new version or none do; on any prepare failure or timeout
-// the round aborts and the leader retries on the next poll/WS cycle.
+// roundAbort describes why a 2PC round is being torn down. reason labels the
+// metric and the log; dedupKind keys the per-version warn dedup.
+type roundAbort struct {
+	reason    string
+	dedupKind string
+	cause     error
+}
+
+// abortRound tears down a 2PC round: warn, broadcast abort, drop the staged value,
+// fail the snapshot. Nothing advances, so the leader retries the same version.
+func (m *Manager) abortRound(
+	ctx context.Context,
+	reg registrable,
+	staged stagedRef,
+	ver config.Version,
+	roundID string,
+	ab roundAbort,
+) {
+	collection, version := reg.name(), ver.String()
+
+	fields := []dlog.Field{
+		dlog.Err(ab.cause),
+		dlog.String("collection", collection),
+		dlog.String("version", version),
+		dlog.String("round_id", roundID),
+		dlog.String("reason", ab.reason),
+	}
+	// Per-version dedup says "this version is bad"; it must not silence "this
+	// replica has never come up", which repeats until a round finally lands.
+	if reg.version().IsZero() || reg.shouldReport(ver, ab.dedupKind) {
+		m.logger.Warn("manager: 2PC aborting round", fields...)
+	} else {
+		m.logger.Debug("manager: 2PC aborting round (dedup)", fields...)
+	}
+
+	abortEvent := notify.Event{
+		Action:     notify.ActionAbort,
+		Collection: collection,
+		Version:    version,
+		RoundID:    roundID,
+	}
+	if pubErr := m.publish(ctx, abortEvent); pubErr != nil {
+		m.logger.Error("manager: publish abort failed", dlog.Err(pubErr), dlog.String("round_id", roundID))
+	}
+
+	reg.abortStaged(staged)
+	m.metrics.StagedDropped(collection, ab.reason)
+	m.failSnapshotUnlessActive(ctx, collection, version)
+
+	m.metrics.SyncFailed(collection, ab.cause)
+}
+
+// failSnapshotUnlessActive marks a snapshot failed unless it may be active — an
+// activation can commit server-side yet error, and demoting it strands restarts.
+func (m *Manager) failSnapshotUnlessActive(ctx context.Context, collection, version string) {
+	active, err := m.getActiveVersion(ctx, collection)
+	switch {
+	case errors.Is(err, storage.ErrSnapshotNotFound):
+		// No active snapshot to protect.
+	case err != nil:
+		m.logger.Warn("manager: leaving snapshot unfailed, active version unreadable",
+			dlog.Err(err), dlog.String("collection", collection), dlog.String("version", version))
+		return
+	case active == version:
+		m.logger.Warn("manager: activation reported an error but the version is active, leaving the snapshot in place",
+			dlog.String("collection", collection), dlog.String("version", version))
+		return
+	}
+
+	if failErr := m.storage.FailSnapshot(ctx, collection, version); failErr != nil {
+		m.logger.Error("manager: fail snapshot after abort",
+			dlog.Err(failErr), dlog.String("collection", collection), dlog.String("version", version))
+	}
+}
+
+// leaderSync2PC runs strict two-phase commit for one config: either all alive
+// replicas move or none do, and an aborted round is retried on the next cycle.
 func (m *Manager) leaderSync2PC(ctx context.Context, reg registrable, force bool) error {
 	collection := reg.name()
 	syncStart := time.Now()
@@ -691,12 +903,8 @@ func (m *Manager) leaderSync2PC(ctx context.Context, reg registrable, force bool
 		return fmt.Errorf("fetch version: %w", err)
 	}
 
-	if force && updatedAt.IsZero() {
-		updatedAt = time.Now().UTC()
-	}
-
-	newVersion := config.NewVersion(updatedAt)
 	currentVersion := reg.version()
+	newVersion := syncVersion(updatedAt, currentVersion, force)
 
 	if !force && !currentVersion.IsZero() && newVersion.Equal(currentVersion) {
 		m.repairCacheEntry(ctx, collection)
@@ -704,6 +912,10 @@ func (m *Manager) leaderSync2PC(ctx context.Context, reg registrable, force bool
 			dlog.String("collection", collection),
 			dlog.String("version", currentVersion.String()),
 		)
+		return nil
+	}
+
+	if !m.allowLeaderAdvance(reg, newVersion) {
 		return nil
 	}
 
@@ -730,9 +942,8 @@ func (m *Manager) leaderSync2PC(ctx context.Context, reg registrable, force bool
 		return fmt.Errorf("save snapshot: %w", err)
 	}
 
-	// 3a. Reset apply log for (collection, version) so stale statuses from a
-	// prior aborted round of the SAME version don't leak into this round's
-	// quorum check. Safe under the advisory lock (only one leader at a time).
+	// 3a. Reset the apply log so statuses from a prior aborted round of the SAME
+	// version cannot count towards this one. Safe under the advisory lock.
 	if err := m.storage.ResetApplyLog(ctx, collection, version); err != nil {
 		reg.abortStaged(staged)
 		return fmt.Errorf("reset apply log: %w", err)
@@ -759,7 +970,7 @@ func (m *Manager) leaderSync2PC(ctx context.Context, reg registrable, force bool
 		Version:    version,
 		RoundID:    roundID,
 	}
-	if err := m.notifier.Publish(ctx, prepareEvent); err != nil {
+	if err := m.publish(ctx, prepareEvent); err != nil {
 		reg.abortStaged(staged)
 		return fmt.Errorf("publish prepare: %w", err)
 	}
@@ -773,77 +984,64 @@ func (m *Manager) leaderSync2PC(ctx context.Context, reg registrable, force bool
 		}
 
 		m.metrics.PreparePhaseFailed(collection, roundID, reason)
-		// Dedup on bare "round_aborted" (not the reason) so a flaky follower
-		// that times out one round and prepare_fails the next still produces
-		// a single warn per (collection, version).
-		if reg.shouldReport(newVersion, "round_aborted") {
-			m.logger.Warn("manager: 2PC aborting round",
-				dlog.Err(waitErr),
-				dlog.String("collection", collection),
-				dlog.String("version", version),
-				dlog.String("round_id", roundID),
-				dlog.String("reason", reason),
-			)
-		} else {
-			m.logger.Debug("manager: 2PC aborting round (dedup)",
-				dlog.String("collection", collection),
-				dlog.String("version", version),
-				dlog.String("round_id", roundID),
-				dlog.String("reason", reason),
-			)
-		}
+		// Dedup on "round_aborted" rather than the reason, so a follower that
+		// times out once and prepare_fails next still warns once per version.
+		m.abortRound(ctx, reg, staged, newVersion, roundID, roundAbort{
+			reason:    reason,
+			dedupKind: "round_aborted",
+			cause:     waitErr,
+		})
 
-		abortEvent := notify.Event{
-			Action:     notify.ActionAbort,
-			Collection: collection,
-			Version:    version,
-			RoundID:    roundID,
-		}
-		if pubErr := m.notifier.Publish(ctx, abortEvent); pubErr != nil {
-			m.logger.Error("manager: publish abort failed", dlog.Err(pubErr), dlog.String("round_id", roundID))
-		}
-
-		reg.abortStaged(staged)
-		m.metrics.StagedDropped(collection, reason)
-
-		if failErr := m.storage.FailSnapshot(ctx, collection, version); failErr != nil {
-			m.logger.Error("manager: fail snapshot after abort",
-				dlog.Err(failErr), dlog.String("collection", collection), dlog.String("version", version))
-		}
-
-		m.metrics.SyncFailed(collection, waitErr)
 		return fmt.Errorf("2PC prepare phase: %w", waitErr)
 	}
 
 	m.metrics.PreparePhaseSucceeded(collection, roundID)
 
-	// 7. Publish commit and apply locally.
+	// 7. Activation IS the commit decision, so it must be durable before the decision
+	// is announced: replicas reconcile against the active snapshot as the event lands.
+	if err := m.storage.ActivateSnapshot(ctx, collection, version); err != nil {
+		m.abortRound(ctx, reg, staged, newVersion, roundID, roundAbort{
+			reason:    "activate_failed",
+			dedupKind: "activate_failed",
+			cause:     err,
+		})
+
+		return fmt.Errorf("activate snapshot: %w", err)
+	}
+
+	// 8. Announce the decision.
 	commitEvent := notify.Event{
 		Action:     notify.ActionCommit,
 		Collection: collection,
 		Version:    version,
 		RoundID:    roundID,
 	}
-	if err := m.notifier.Publish(ctx, commitEvent); err != nil {
+	if err := m.publish(ctx, commitEvent); err != nil {
 		m.logger.Error("manager: publish commit failed — followers may lag until next sync",
 			dlog.Err(err), dlog.String("collection", collection), dlog.String("round_id", roundID))
-		// Commit locally anyway; state in storage is correct and followers will catch up.
+		// Commit locally anyway; the decision is durable and followers catch up.
 	}
 
-	if err := reg.commitStaged(staged); err != nil {
-		return fmt.Errorf("commit staged: %w", err)
+	// 9. Apply locally, now that the decision is durable and broadcast.
+	if err := m.applyStaged(reg, staged, newVersion); err != nil {
+		return fmt.Errorf("2PC local apply after commit: %w", err)
 	}
 
-	if err := m.storage.LogApply(ctx, m.instanceID, collection, version, applyStatusCommitted); err != nil {
-		m.logger.Error("manager: log self committed", dlog.Err(err))
-	}
+	// 10. Record this instance's outcome.
+	m.logApplyStatus(ctx, collection, version, applyStatusCommitted)
 
-	// 8. Cache write AFTER commit so an aborted round never warms the cache.
+	// 11. Cache write AFTER commit so an aborted round never warms the cache.
 	m.cacheWrite(ctx, collection, version, content)
 
-	// 9. Activate snapshot.
-	if err := m.storage.ActivateSnapshot(ctx, collection, version); err != nil {
-		return fmt.Errorf("activate snapshot: %w", err)
+	// 12. Fallback for a follower that missed the commit event: the snapshot is
+	// active by now, so the eventually-consistent path can apply it too.
+	fallbackEvent := notify.Event{
+		Action:     notify.ActionSync,
+		Collection: collection,
+		Version:    version,
+	}
+	if pubErr := m.publish(ctx, fallbackEvent); pubErr != nil {
+		m.logger.Warn("manager: 2PC fallback sync publish failed", dlog.Err(pubErr))
 	}
 
 	m.metrics.SyncCompleted(collection, time.Since(syncStart), len(content))
@@ -853,27 +1051,11 @@ func (m *Manager) leaderSync2PC(ctx context.Context, reg registrable, force bool
 		dlog.String("round_id", roundID),
 	)
 
-	// 10. Publish a fallback sync event so followers that missed the commit
-	// notification (e.g. due to a transient connection drop) can still apply
-	// via the eventually-consistent path. The active snapshot is now in
-	// storage, so handleSyncEvent will find it.
-	fallbackEvent := notify.Event{
-		Action:     notify.ActionSync,
-		Collection: collection,
-		Version:    version,
-	}
-	if pubErr := m.notifier.Publish(ctx, fallbackEvent); pubErr != nil {
-		m.logger.Warn("manager: 2PC fallback sync publish failed", dlog.Err(pubErr))
-	}
-
 	return nil
 }
 
-// waitPreparesOrAbort polls the apply log until every instance in target has
-// logged "prepared", short-circuiting with errPrepareFailed as soon as any
-// target logs "prepare_failed". Targets that stop heartbeating during the
-// wait are dropped (effectiveTarget = target ∩ alive) so a dead replica
-// cannot block the round.
+// waitPreparesOrAbort polls the apply log until every target has logged "prepared",
+// short-circuiting on a "prepare_failed". Targets that stop heartbeating are dropped.
 func (m *Manager) waitPreparesOrAbort(ctx context.Context, collection, version string, target []string) error {
 	if len(target) == 0 {
 		return nil
@@ -909,9 +1091,8 @@ func (m *Manager) waitPreparesOrAbort(ctx context.Context, collection, version s
 	}
 }
 
-// checkPrepares returns done=true when every still-alive member of targetSet
-// has logged "prepared". Returns errPrepareFailed as soon as any still-alive
-// target logs "prepare_failed".
+// checkPrepares reports whether every still-alive target has logged "prepared",
+// erroring with errPrepareFailed as soon as one logs "prepare_failed".
 func (m *Manager) checkPrepares(ctx context.Context, collection, version string, targetSet map[string]struct{}) (bool, error) {
 	alive, err := m.registry.AliveInstances(ctx, m.opts.ServiceName)
 	if err != nil {
@@ -960,9 +1141,8 @@ func (m *Manager) checkPrepares(ctx context.Context, collection, version string,
 func (m *Manager) handlePrepareEvent(ctx context.Context, event notify.Event) {
 	reg, ok := m.configs[event.Collection]
 	if !ok {
-		// Unknown collection — acknowledge the prepare so the 2PC round
-		// is not blocked by pods that don't manage this collection
-		// (e.g. during rolling deployment when a new collection is added).
+		// Acknowledge a collection this replica does not manage, or a rolling
+		// deployment that adds one would block every round on the older pods.
 		m.logApplyStatus(ctx, event.Collection, event.Version, applyStatusPrepared)
 		return
 	}
@@ -1009,9 +1189,8 @@ func (m *Manager) handlePrepareEvent(ctx context.Context, event notify.Event) {
 	)
 }
 
-// handleCommitEvent is the follower side of 2PC phase 2: swap the staged value
-// live. Falls back to reloading the snapshot from storage if the staged value
-// is gone (e.g., TTL expired).
+// handleCommitEvent is the follower side of 2PC phase 2: swap the staged value live,
+// falling back to a storage reload when it is gone (TTL expired).
 func (m *Manager) handleCommitEvent(ctx context.Context, event notify.Event) {
 	reg, ok := m.configs[event.Collection]
 	if !ok {
@@ -1031,8 +1210,8 @@ func (m *Manager) handleCommitEvent(ctx context.Context, event notify.Event) {
 	}
 
 	if !found {
-		// Staged entry missing — fall back to storage. We already logged
-		// "prepared", so we must honor commit to preserve the invariant.
+		// This replica logged "prepared", so it must honour the commit even with
+		// the staged value gone — reload the payload from storage.
 		m.logger.Warn("manager: staged entry missing on commit, loading from storage",
 			dlog.String("collection", event.Collection),
 			dlog.String("round_id", event.RoundID),
@@ -1078,9 +1257,8 @@ func (m *Manager) handleCommitEvent(ctx context.Context, event notify.Event) {
 	)
 }
 
-// handleAbortEvent drops the follower's staged snapshot without applying.
-// Intentionally does NOT write an apply_log entry: an aborted round leaves
-// no trace in the log (the leader marks the snapshot itself as failed).
+// handleAbortEvent drops the follower's staged snapshot without applying. No
+// apply_log entry on purpose — the leader marks the snapshot failed itself.
 func (m *Manager) handleAbortEvent(_ context.Context, event notify.Event) {
 	reg, ok := m.configs[event.Collection]
 	if !ok {

@@ -65,10 +65,7 @@ func TestOr_CombinesFilters(t *testing.T) {
 }
 
 func TestBuildQuery_EncodesAllParams(t *testing.T) {
-	// We can't call buildQuery directly (unexported), so test through Items.
-	// Instead, test the filter JSON structure and WithFields output.
-
-	// Test Filter serialization via Field + And.
+	// buildQuery is unexported, so assert on the filter JSON it would encode.
 	filter := directus.And(
 		directus.Field("status", "_eq", "published"),
 		directus.Field("level", "_gte", 5),
@@ -84,7 +81,8 @@ func TestBuildQuery_EncodesAllParams(t *testing.T) {
 }
 
 func TestWithDeep_ProducesCorrectJSON(t *testing.T) {
-	// Test that RelationQuery serializes correctly.
+	// RelationQuery.toMap is unexported, so this pins the _filter/_sort/_limit
+	// shape it has to produce rather than calling it.
 	limit := 5
 	rq := directus.RelationQuery{
 		Filter: directus.Field("languages_code", "_eq", "en-US"),
@@ -121,8 +119,6 @@ func TestWithDeep_ProducesCorrectJSON(t *testing.T) {
 
 
 func TestWithTranslations_AddsFieldsAndDeep(t *testing.T) {
-	// Test through the items endpoint by checking the query params.
-	// We need an HTTP server that captures the query string.
 	var gotQuery url.Values
 
 	srv := newTestServer(func(w http.ResponseWriter, r *http.Request) {

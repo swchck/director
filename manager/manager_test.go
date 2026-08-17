@@ -15,17 +15,34 @@ import (
 	"github.com/swchck/director/directus"
 	"github.com/swchck/director/manager"
 	"github.com/swchck/director/notify"
+	"github.com/swchck/director/notify/notifytest"
 	"github.com/swchck/director/storage"
 )
 
 // Mock implementations
 
 type mockStorage struct {
-	mu           sync.Mutex
-	snapshots    map[string]*storage.Snapshot
-	applyLog     map[string]int                // key = collection:version, counts "applied" only
-	applyByStat  map[string]map[string][]string // key = collection:version:status -> []instanceID
-	lockHeld     bool
+	mu          sync.Mutex
+	snapshots   map[string]*storage.Snapshot
+	applyLog    map[string]int                 // key = collection:version, counts "applied" only
+	applyByStat map[string]map[string][]string // key = collection:version:status -> []instanceID
+	lockHeld    bool
+
+	// onGetSnapshot, when set, is invoked on every GetSnapshot call. Tests use
+	// it to count redundant snapshot reads.
+	onGetSnapshot func(collection, version string)
+
+	// onActivateSnapshot, when set, gates ActivateSnapshot: a non-nil return
+	// aborts activation, leaving snapshot statuses untouched.
+	onActivateSnapshot func(collection, version string) error
+
+	// onLogApply runs on every LogApply. Tests count writes that upsert semantics
+	// hide, and fail one: a non-nil return replaces recording the row.
+	onLogApply func(instanceID, collection, version, status string) error
+
+	// onGetActiveSnapshot, when set, gates GetActiveSnapshot: a non-nil return
+	// is surfaced to the caller instead of the stored snapshot.
+	onGetActiveSnapshot func(collection string) error
 }
 
 func newMockStorage() *mockStorage {
@@ -56,9 +73,18 @@ func (s *mockStorage) SaveSnapshot(_ context.Context, collection, version string
 
 func (s *mockStorage) ActivateSnapshot(_ context.Context, collection, version string) error {
 	s.mu.Lock()
+	hook := s.onActivateSnapshot
+	s.mu.Unlock()
+
+	if hook != nil {
+		if err := hook(collection, version); err != nil {
+			return err
+		}
+	}
+
+	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Deactivate old.
 	for k, snap := range s.snapshots {
 		if snap.Collection == collection && snap.Status == storage.StatusActive {
 			s.snapshots[k].Status = storage.StatusInactive
@@ -73,7 +99,52 @@ func (s *mockStorage) ActivateSnapshot(_ context.Context, collection, version st
 	return nil
 }
 
+// forceActive marks a snapshot active without consulting onActivateSnapshot, modelling
+// a transaction that commits server-side while the client sees a connection error.
+func (s *mockStorage) forceActive(collection, version string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, snap := range s.snapshots {
+		if snap.Collection == collection && snap.Status == storage.StatusActive {
+			snap.Status = storage.StatusInactive
+		}
+	}
+
+	if snap, ok := s.snapshots[collection+":"+version]; ok {
+		snap.Status = storage.StatusActive
+	}
+}
+
+// activeArticleVersions returns every active version of "articles". More than one, or
+// none, means the snapshot lifecycle was left inconsistent.
+func (s *mockStorage) activeArticleVersions() []string {
+	const collection = "articles"
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var out []string
+	for _, snap := range s.snapshots {
+		if snap.Collection == collection && snap.Status == storage.StatusActive {
+			out = append(out, snap.Version)
+		}
+	}
+
+	return out
+}
+
 func (s *mockStorage) GetActiveSnapshot(_ context.Context, collection string) (*storage.Snapshot, error) {
+	s.mu.Lock()
+	hook := s.onGetActiveSnapshot
+	s.mu.Unlock()
+
+	if hook != nil {
+		if err := hook(collection); err != nil {
+			return nil, err
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -87,6 +158,14 @@ func (s *mockStorage) GetActiveSnapshot(_ context.Context, collection string) (*
 }
 
 func (s *mockStorage) GetSnapshot(_ context.Context, collection, version string) (*storage.Snapshot, error) {
+	s.mu.Lock()
+	hook := s.onGetSnapshot
+	s.mu.Unlock()
+
+	if hook != nil {
+		hook(collection, version)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -111,6 +190,16 @@ func (s *mockStorage) FailSnapshot(_ context.Context, collection, version string
 }
 
 func (s *mockStorage) LogApply(_ context.Context, instanceID, collection, version, status string) error {
+	s.mu.Lock()
+	hook := s.onLogApply
+	s.mu.Unlock()
+
+	if hook != nil {
+		if err := hook(instanceID, collection, version, status); err != nil {
+			return err
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -202,6 +291,8 @@ func (s *mockStorage) AcquireLock(_ context.Context, _ int64) (func(), error) {
 	}, nil
 }
 
+// mockNotifier honours the notify.Channel broadcast contract, self-delivery
+// included, so manager tests see a leader receive its own events.
 type mockNotifier struct {
 	mu     sync.Mutex
 	events []notify.Event
@@ -220,7 +311,28 @@ func (n *mockNotifier) Publish(_ context.Context, event notify.Event) error {
 	defer n.mu.Unlock()
 
 	n.events = append(n.events, event)
+
+	if n.closed {
+		return notify.ErrClosed
+	}
+
+	// Drop instead of block when the buffer is full, as notify/postgres does —
+	// a blocking send deadlocks a publish made on the draining goroutine.
+	select {
+	case n.subCh <- event:
+	default:
+	}
+
 	return nil
+}
+
+// record appends an event without delivering it — for doubles simulating a
+// publish failure that still want the attempt visible to assertions.
+func (n *mockNotifier) record(event notify.Event) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.events = append(n.events, event)
 }
 
 func (n *mockNotifier) Subscribe(_ context.Context) (<-chan notify.Event, error) {
@@ -248,11 +360,23 @@ func (n *mockNotifier) publishedEvents() []notify.Event {
 	return result
 }
 
+// TestMockNotifier_HonorsChannelContract keeps the double honest: if it stops
+// broadcasting, every manager test above runs against a transport that does not exist.
+func TestMockNotifier_HonorsChannelContract(t *testing.T) {
+	notifytest.RunContract(t, func(t *testing.T) (notify.Channel, notify.Channel) {
+		n := newMockNotifier()
+		t.Cleanup(func() { n.Close() })
+
+		return n, n
+	})
+}
+
 type mockRegistry struct {
-	mu                sync.Mutex
-	count             int
-	instances         []string // if empty, derived from count as ["self"] etc.
-	deleteStaleCalls  int      // counts DeleteStaleInstances invocations
+	mu               sync.Mutex
+	count            int
+	instances        []string // if empty, derived from count as ["self"] etc.
+	deleteStaleCalls int      // counts DeleteStaleInstances invocations
+	heartbeats       int      // counts Heartbeat invocations
 }
 
 func newMockRegistry() *mockRegistry {
@@ -260,8 +384,22 @@ func newMockRegistry() *mockRegistry {
 }
 
 func (r *mockRegistry) Register(_ context.Context, _, _ string) error { return nil }
-func (r *mockRegistry) Heartbeat(_ context.Context, _ string) error   { return nil }
 func (r *mockRegistry) Deregister(_ context.Context, _ string) error  { return nil }
+
+func (r *mockRegistry) Heartbeat(_ context.Context, _ string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.heartbeats++
+
+	return nil
+}
+
+func (r *mockRegistry) heartbeatCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.heartbeats
+}
 
 func (r *mockRegistry) AliveCount(_ context.Context, _ string) (int, error) {
 	r.mu.Lock()
@@ -348,7 +486,6 @@ func TestManager_RegisterAndStart_SyncsFromDirectus(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Start in goroutine (blocking call).
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- mgr.Start(ctx)
@@ -357,7 +494,6 @@ func TestManager_RegisterAndStart_SyncsFromDirectus(t *testing.T) {
 	// Give it time to do initial sync.
 	time.Sleep(500 * time.Millisecond)
 
-	// Verify data was synced.
 	if articles.Count() != 2 {
 		t.Errorf("Count() = %d, want 2", articles.Count())
 	}
@@ -371,7 +507,6 @@ func TestManager_RegisterAndStart_SyncsFromDirectus(t *testing.T) {
 		t.Error("Version should not be zero after sync")
 	}
 
-	// Verify a sync notification was published.
 	events := notif.publishedEvents()
 	if len(events) == 0 {
 		t.Error("expected at least one sync event published")
@@ -379,7 +514,6 @@ func TestManager_RegisterAndStart_SyncsFromDirectus(t *testing.T) {
 		t.Errorf("event = %+v, want sync/articles", events[0])
 	}
 
-	// Stop.
 	cancel()
 	<-errCh
 }
@@ -453,7 +587,6 @@ func TestManager_ViewRecomputesOnSync(t *testing.T) {
 	go mgr.Start(ctx)
 	time.Sleep(500 * time.Millisecond)
 
-	// View should have recomputed from the synced data.
 	if foodView.Count() != 2 {
 		t.Errorf("food view Count() = %d, want 2 (Alpha + Gamma)", foodView.Count())
 	}
@@ -469,14 +602,8 @@ func TestManager_ViewRecomputesOnSync(t *testing.T) {
 }
 
 func TestManager_WebSocket_TriggersImmediateSync(t *testing.T) {
-	// The WS test works by simulating what happens when handleWSChange is called.
-	// We can't easily mock WSClient.Subscribe (it connects to a real server),
-	// but we can test the syncOne/handleWSChange path directly by running the
-	// manager and injecting a ws-style trigger via SyncNow for the same code path.
-	//
-	// Instead, we test the full flow: start manager, then after initial sync
-	// update the Directus server response and trigger SyncNow (same code path
-	// as WS-triggered syncOne).
+	// WSClient.Subscribe needs a live WS server, so the trigger here is SyncNow, which
+	// syncs unforced — hence the newer date_updated below.
 
 	fetchCount := 0
 	now := time.Now().UTC().Truncate(time.Second)
@@ -547,7 +674,6 @@ func TestManager_WebSocket_TriggersImmediateSync(t *testing.T) {
 	// Wait for initial sync to complete (includes ~500ms waitConfirmations tick).
 	time.Sleep(2 * time.Second)
 
-	// Initial sync: 1 item.
 	if articles.Count() != 1 {
 		t.Fatalf("initial: Count() = %d, want 1", articles.Count())
 	}
@@ -557,11 +683,11 @@ func TestManager_WebSocket_TriggersImmediateSync(t *testing.T) {
 	useV2 = true
 	mu.Unlock()
 
-	// Trigger immediate sync (same code path as WS-triggered syncOne → leaderSync).
-	// SyncNow is synchronous — by the time it returns, data is swapped.
+	// SyncNow hands the cycle to the run loop, so wait for the swap.
 	mgr.SyncNow(ctx)
 
-	// Should now have 3 items.
+	waitFor(t, 5*time.Second, func() bool { return articles.Count() == 3 })
+
 	if articles.Count() != 3 {
 		t.Errorf("after sync: Count() = %d, want 3", articles.Count())
 	}

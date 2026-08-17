@@ -64,9 +64,26 @@ func (c *trackingCache) articlesEntry() *cache.Entry {
 	return c.entries["articles"]
 }
 
-// seedActiveSnapshot writes an active snapshot for the "articles" collection
-// to mock storage. The collection name is fixed because every cache-repair
-// test exercises a single registered collection.
+// seedCacheVersion writes a cache entry for the "articles" collection, standing
+// in for what a leader leaves behind after activating that version.
+func seedCacheVersion(t *testing.T, c *trackingCache, version string, items []twoPCArticle) {
+	t.Helper()
+
+	content, err := json.Marshal(items)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := c.Set(context.Background(), cache.Entry{
+		Collection: "articles",
+		Version:    version,
+		Content:    content,
+	}); err != nil {
+		t.Fatalf("cache set: %v", err)
+	}
+}
+
+// seedActiveSnapshot writes an active snapshot for "articles" — the single
+// collection every cache-repair test registers.
 func seedActiveSnapshot(t *testing.T, store *mockStorage, version string, items []twoPCArticle) {
 	t.Helper()
 	payload, err := json.Marshal(items)
@@ -82,9 +99,8 @@ func seedActiveSnapshot(t *testing.T, store *mockStorage, version string, items 
 	}
 }
 
-// TestCacheRepair_LeaderSyncWarmsColdCache: storage has active v1, cache is
-// empty, source reports v1 (no version change). The leader's version-skip
-// branch must repair the cache.
+// TestCacheRepair_LeaderSyncWarmsColdCache: storage has active v1, cache is empty and
+// the source reports v1, so the leader's version-skip branch must repair the cache.
 func TestCacheRepair_LeaderSyncWarmsColdCache(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	versionStr := config.NewVersion(now).String()
@@ -244,10 +260,8 @@ func TestCacheRepair_NoOpWhenWritesDisabled(t *testing.T) {
 	<-errCh
 }
 
-// TestCacheRepair_ManualSyncOnly_WarmsOnStartup: with ManualSyncOnly=true,
-// storage has data, cache is cold — syncAll is skipped, but the explicit
-// warmCacheIfMissing step in Start() must populate the cache. The source
-// must NOT be called (no version fetch, no list).
+// TestCacheRepair_ManualSyncOnly_WarmsOnStartup: syncAll is skipped, so Start's
+// warmCacheIfMissing must fill the cold cache without touching the source at all.
 func TestCacheRepair_ManualSyncOnly_WarmsOnStartup(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	versionStr := config.NewVersion(now).String()
@@ -430,5 +444,5 @@ func (s *countingSource) LastModified(_ context.Context) (time.Time, error) {
 	return time.Time{}, nil
 }
 
-// Prevent unused-import warnings on rare combinations.
+// Keeps the storage import in place for the mock's error sentinels.
 var _ = storage.ErrSnapshotNotFound

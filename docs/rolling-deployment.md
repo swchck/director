@@ -109,12 +109,16 @@ http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 The manager startup sequence loads data in priority order:
 
 1. **Cache** (Redis) — sub-second, data available immediately
-2. **Storage** (Postgres active snapshot) — fast, skipped if cache was fresh
+2. **Storage** (Postgres active snapshot) — fast, and canonical: applied unless it names the version the cache already provided
 3. **Source sync** — only runs if `hasEmptyConfigs()` (ManualSyncOnly) or always (auto mode)
 
-With a hot cache, `Start()` loads all collections from cache, confirms versions match, and enters the event loop — no source or 2PC round-trips needed.
+The notify subscription is established *before* all three, because a pod is a target of every peer's 2PC round from its registration onward and the transports do not replay events published before a subscription existed. A pod that is still loading can therefore answer a `prepare` as soon as its run loop comes up, instead of costing that round an abort.
 
-Do **not** call `SyncNow()` before `Start()`. Since `SyncNow()` runs before cache is loaded, every collection has a zero version, triggering a full source fetch and 2PC round for each one — even when the cache already has fresh data.
+With a hot cache, `Start()` loads all collections from cache, confirms versions match, and enters the run loop — no source or 2PC round-trips needed.
+
+In `ManualSyncOnly` mode the source sync is retried on the reconcile tick while any config is still unloaded, so a bootstrap round that aborted — for instance against a peer that was itself still starting — does not leave the pod permanently unready. Retries stop once every config has a version.
+
+A `SyncNow()` call made before `Start()` is not lost: the request waits in the buffer and the run loop serves it as soon as it comes up. The cycle itself only ever runs on the run loop, so a sync endpoint that is reachable before `Start()` — the usual case, since the HTTP server comes up first — still gets its sync. Gate the endpoint on `Ready()` if callers must not see a config that has not loaded yet.
 
 ### preStop hook
 

@@ -31,9 +31,8 @@ func (w testLogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// behaviorSource is a controllable source used by behavior tests to verify
-// that the manager honors documented invariants (independence, rollback,
-// register-after-Start panic).
+// behaviorSource is a controllable source for verifying documented invariants:
+// collection independence, rollback, register-after-Start panic.
 type behaviorSource struct {
 	name         string
 	mu           sync.Mutex
@@ -57,14 +56,8 @@ func (s *behaviorSource) LastModified(_ context.Context) (time.Time, error) {
 	return s.lastModified, nil
 }
 
-// TestManager_RollbackEvent_RevertsToActiveSnapshot:
-// Documented behavior: "Rollback — if the confirmation timeout expires before
-// all replicas confirm, leader publishes rollback; all replicas load the
-// previous active snapshot and swap back."
-//
-// We test the follower-side behavior: when a `rollback` event arrives, the
-// follower must load the currently-active snapshot from storage and swap
-// to it, regardless of its current in-memory version.
+// TestManager_RollbackEvent_RevertsToActiveSnapshot: a rollback event makes a replica
+// load the active snapshot whatever it holds. Operator-driven; no timeout emits one.
 func TestManager_RollbackEvent_RevertsToActiveSnapshot(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -92,9 +85,8 @@ func TestManager_RollbackEvent_RevertsToActiveSnapshot(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- mgr.Start(ctx) }()
 
-	// Wait for initial sync to FULLY settle: data in memory AND snapshot
-	// activated in storage. We must wait for ActivateSnapshot so our subsequent
-	// activate doesn't race with it.
+	// Wait for the snapshot to be activated as well as applied, or the activate
+	// below races the one the initial sync is still doing.
 	initialVersion := config.NewVersion(now).String()
 	waitFor(t, 3*time.Second, func() bool {
 		if _, ok := products.Find(func(a twoPCArticle) bool { return a.ID == 1 }); !ok {
@@ -118,14 +110,12 @@ func TestManager_RollbackEvent_RevertsToActiveSnapshot(t *testing.T) {
 		t.Fatalf("Activate good: %v", err)
 	}
 
-	// Send a rollback event.
 	notif.subCh <- notify.Event{
 		Action:     "rollback",
 		Collection: "products",
 		Version:    goodVersion,
 	}
 
-	// Manager should swap to the active snapshot (id=99).
 	waitFor(t, 2*time.Second, func() bool {
 		_, ok := products.Find(func(a twoPCArticle) bool { return a.ID == 99 })
 		return ok
@@ -142,9 +132,8 @@ func TestManager_RollbackEvent_RevertsToActiveSnapshot(t *testing.T) {
 	<-errCh
 }
 
-// TestManager_RegisterAfterStart_Panics:
-// Documented behavior: "Runtime guard: manager.register() panics if called
-// after Start()."
+// TestManager_RegisterAfterStart_Panics: documented behavior — register() panics
+// when called after Start().
 func TestManager_RegisterAfterStart_Panics(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -156,9 +145,8 @@ func TestManager_RegisterAfterStart_Panics(t *testing.T) {
 	src := &behaviorSource{lastModified: time.Now().UTC()}
 	first := config.NewCollection[twoPCArticle]("first")
 
-	// Use Subscribe as a synchronization point: it is called by Start AFTER
-	// the started flag is set, so once Subscribe is invoked we know the guard
-	// is active.
+	// Subscribe is the barrier: Start enters phaseRunning — which is what the
+	// register guard checks — well before it subscribes.
 	startedSig := make(chan struct{})
 	signalNotif := &startSignalNotifier{
 		mockNotifier: notif,
@@ -200,8 +188,6 @@ func TestManager_RegisterAfterStart_Panics(t *testing.T) {
 }
 
 // startSignalNotifier wraps mockNotifier and signals when Subscribe is called.
-// Subscribe is invoked by Manager.Start AFTER `started` is set, so it is a
-// safe synchronization point for "manager has fully entered run state".
 type startSignalNotifier struct {
 	*mockNotifier
 	signal chan struct{}
@@ -213,9 +199,8 @@ func (n *startSignalNotifier) Subscribe(ctx context.Context) (<-chan notify.Even
 	return n.mockNotifier.Subscribe(ctx)
 }
 
-// TestManager_CollectionsAreIndependent: Documented behavior: "Each collection
-// is independent — a change in collection A does NOT trigger sync/rebuild of
-// collection B." Verified via List() call counts.
+// TestManager_CollectionsAreIndependent: a change in collection A must not sync or
+// rebuild collection B. Verified via List() call counts.
 func TestManager_CollectionsAreIndependent(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -242,7 +227,6 @@ func TestManager_CollectionsAreIndependent(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- mgr.Start(ctx) }()
 
-	// Wait for initial sync to fetch both collections once.
 	waitFor(t, 3*time.Second, func() bool {
 		return srcA.listCalls.Load() >= 1 && srcB.listCalls.Load() >= 1
 	})
@@ -264,7 +248,6 @@ func TestManager_CollectionsAreIndependent(t *testing.T) {
 		Version:    newAlphaVer,
 	}
 
-	// Wait for alpha to gain id=2.
 	waitFor(t, 2*time.Second, func() bool {
 		_, ok := collA.Find(func(a twoPCArticle) bool { return a.ID == 2 })
 		return ok
@@ -292,9 +275,8 @@ func TestManager_CollectionsAreIndependent(t *testing.T) {
 
 // -- WebSocket behavior tests ---------------------------------------------
 
-// wsBehaviorServer is a minimal Directus-protocol WS server. The events
-// channel lets the test push subscription events; closing `closeAfter`
-// disconnects the client to test fallback behavior.
+// wsBehaviorServer is a minimal Directus-protocol WS server: events pushes
+// subscription events, closing closeAfter disconnects to test fallback.
 type wsBehaviorServer struct {
 	t             *testing.T
 	srv           *httptest.Server
@@ -321,17 +303,15 @@ func newWSBehaviorServer(t *testing.T, sendEvents func(uid string, write func(ma
 
 		ctx := r.Context()
 
-		// 1. Read auth, reply ok.
+		// Auth handshake.
 		if _, _, err := conn.Read(ctx); err != nil {
 			return
 		}
 		authResp, _ := json.Marshal(map[string]any{"type": "auth", "status": "ok"})
 		_ = conn.Write(ctx, websocket.MessageText, authResp)
 
-		// 2. Read exactly one subscribe message. The Manager subscribes once per
-		// collection at startup; tests that need more subs would loop here.
-		// We avoid a read-timeout pattern because the websocket library treats
-		// a cancelled Read context as a fatal protocol error and closes the conn.
+		// Exactly one subscribe message, blocking rather than deadlined: the websocket
+		// library treats a cancelled Read context as fatal and closes the connection.
 		var firstUID string
 		_, data, err := conn.Read(ctx)
 		if err != nil {
@@ -349,7 +329,6 @@ func newWSBehaviorServer(t *testing.T, sendEvents func(uid string, write func(ma
 			}
 		}
 
-		// 3. Optionally send events using the captured UID.
 		write := func(payload map[string]any) {
 			b, _ := json.Marshal(payload)
 			_ = conn.Write(ctx, websocket.MessageText, b)
@@ -358,10 +337,8 @@ func newWSBehaviorServer(t *testing.T, sendEvents func(uid string, write func(ma
 			sendEvents(firstUID, write)
 		}
 
-		// 4. Wait for either the test to ask us to close, or the context to end.
 		select {
 		case <-w.closeAfter:
-			// Force-close the connection — manager's read loop should drop the channel.
 			_ = conn.Close(websocket.StatusGoingAway, "test forced close")
 		case <-ctx.Done():
 		}
@@ -388,16 +365,9 @@ func httpDirectusServer(t *testing.T, items []twoPCArticle, ts time.Time, fetchC
 	}))
 }
 
-// TestManager_WebSocketDebouncing_BulkEventsCollapseToOneSync: documented
-// behavior: "WS events are debounced per collection (default 2s). During bulk
-// operations: ... timer fires → sync 'products' ONCE — one refetch — one
-// view recompute."
-//
-// Strategy: the WS test server fires 5 "create" events back-to-back. Even
-// after the debounce window expires, the manager must call List() ONCE for
-// the collection (not 5 times).
+// TestManager_WebSocketDebouncing_BulkEventsCollapseToOneSync: a bulk operation is one
+// WS event per item; the debounce window must collapse 5 of them into one List call.
 func TestManager_WebSocketDebouncing_BulkEventsCollapseToOneSync(t *testing.T) {
-	// Skip on race-disabled builds because debounce timing is sensitive.
 	now := time.Now().UTC().Truncate(time.Second)
 
 	var fetches atomic.Int32
@@ -471,12 +441,8 @@ func TestManager_WebSocketDebouncing_BulkEventsCollapseToOneSync(t *testing.T) {
 	<-errCh
 }
 
-// TestManager_WebSocketFallback_OnChannelClose: documented behavior: "If the
-// WebSocket connection drops: WS channel closes → Manager sets wsEvents=nil
-// → poll ticker resets to normal PollInterval → no panics, no goroutine leaks."
-//
-// We assert: (1) no panic, (2) Start does not return an error before ctx is
-// cancelled, (3) goroutine count is bounded after the WS dies.
+// TestManager_WebSocketFallback_OnChannelClose: a dropped WebSocket must leave the
+// manager polling — no panic, no early return from Start, no goroutine leak.
 func TestManager_WebSocketFallback_OnChannelClose(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 
@@ -536,7 +502,6 @@ func TestManager_WebSocketFallback_OnChannelClose(t *testing.T) {
 	// Give the manager a moment to react and clean up.
 	time.Sleep(600 * time.Millisecond)
 
-	// No panic should have occurred.
 	select {
 	case err := <-errCh:
 		// If Start returned, it must be due to context cancellation, not a WS-related error.
@@ -556,7 +521,6 @@ func TestManager_WebSocketFallback_OnChannelClose(t *testing.T) {
 		t.Errorf("goroutine leak suspected after WS close: before=%d after=%d", gBefore, gAfter)
 	}
 
-	// Cancel and verify clean shutdown.
 	cancel()
 	select {
 	case err := <-errCh:
@@ -575,18 +539,14 @@ type recoverErr struct{ val any }
 
 func (e *recoverErr) Error() string { return "panic: \u00ab" }
 
-// Sanity: behaviorSource implements source contract used elsewhere.
 var _ = (*behaviorSource).List
 
-// Sanity: storage interface still satisfied by mockStorage (used in this file).
 var _ storage.Storage = (*mockStorage)(nil)
 
 // -- Maintenance loop tests -----------------------------------------------
 
-// TestManager_Maintenance_DeletesOldSnapshotsAndStaleInstances verifies that
-// when SnapshotRetention and InstanceRetention are configured, the periodic
-// maintenance loop (running on the leader) calls the GC methods. We use a
-// short MaintenanceInterval so the test doesn't wait an hour.
+// TestManager_Maintenance_DeletesOldSnapshotsAndStaleInstances: with both retentions
+// configured, the leader's maintenance loop must call the GC methods.
 func TestManager_Maintenance_DeletesOldSnapshotsAndStaleInstances(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -621,7 +581,6 @@ func TestManager_Maintenance_DeletesOldSnapshotsAndStaleInstances(t *testing.T) 
 	errCh := make(chan error, 1)
 	go func() { errCh <- mgr.Start(ctx) }()
 
-	// Wait for at least one maintenance tick to fire.
 	waitFor(t, 3*time.Second, func() bool {
 		reg.mu.Lock()
 		calls := reg.deleteStaleCalls
@@ -662,9 +621,8 @@ func TestManager_Maintenance_DeletesOldSnapshotsAndStaleInstances(t *testing.T) 
 	<-errCh
 }
 
-// TestManager_Maintenance_DisabledByDefault verifies that when both retentions
-// are zero (default), the maintenance loop never fires — DeleteStaleInstances
-// is never called and old snapshots are preserved.
+// TestManager_Maintenance_DisabledByDefault: with both retentions zero the maintenance
+// loop never fires — no DeleteStaleInstances, and old snapshots are preserved.
 func TestManager_Maintenance_DisabledByDefault(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

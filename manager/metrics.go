@@ -2,26 +2,8 @@ package manager
 
 import "time"
 
-// Metrics receives telemetry from the sync lifecycle.
-// Implement this interface to export metrics to Prometheus, OpenTelemetry, StatsD, etc.
-//
-// All methods must be safe for concurrent use.
-// A no-op implementation is used when no Metrics is configured.
-//
-// Example with Prometheus:
-//
-//	type promMetrics struct {
-//	    syncTotal    *prometheus.CounterVec
-//	    syncDuration *prometheus.HistogramVec
-//	    syncErrors   *prometheus.CounterVec
-//	    cacheHits    prometheus.Counter
-//	    cacheMisses  prometheus.Counter
-//	}
-//
-//	func (m *promMetrics) SyncCompleted(collection string, duration time.Duration, itemCount int) {
-//	    m.syncTotal.WithLabelValues(collection).Inc()
-//	    m.syncDuration.WithLabelValues(collection).Observe(duration.Seconds())
-//	}
+// Metrics receives sync-lifecycle telemetry; all methods must be safe for
+// concurrent use. LeadershipMetrics and SourceMetrics are optional additions.
 type Metrics interface {
 	// SyncCompleted is called after a successful leader sync (poll or WS-triggered).
 	SyncCompleted(collection string, duration time.Duration, itemCount int)
@@ -35,10 +17,10 @@ type Metrics interface {
 	// FollowerFailed is called when a follower fails to apply a snapshot.
 	FollowerFailed(collection string, err error)
 
-	// CacheHit is called when a collection is loaded from cache on startup.
+	// CacheHit is called when a collection's cache entry is read on startup.
 	CacheHit(collection string)
 
-	// CacheMiss is called when a collection is not found in cache on startup.
+	// CacheMiss is called when a startup cache read misses or errors.
 	CacheMiss(collection string)
 
 	// StorageLoaded is called when a collection is loaded from storage on startup.
@@ -55,9 +37,8 @@ type Metrics interface {
 	// staged a new version in a 2PC round.
 	PreparePhaseSucceeded(collection, roundID string)
 
-	// PreparePhaseFailed is called when a 2PC round aborts — either because
-	// a follower returned prepare_failed or because the prepare timeout
-	// elapsed. reason is "prepare_failed" or "timeout".
+	// PreparePhaseFailed is called when a 2PC prepare phase fails. reason is
+	// "prepare_failed" (a follower rejected) or "timeout".
 	PreparePhaseFailed(collection, roundID, reason string)
 
 	// FollowerPrepared is called when a follower successfully stages a
@@ -68,47 +49,62 @@ type Metrics interface {
 	// 2PC snapshot.
 	FollowerPrepareFailed(collection string, err error)
 
-	// StagedDropped is called when a staged 2PC snapshot is discarded
-	// before commit — via abort, TTL expiry, or explicit drop.
+	// StagedDropped is called when a staged 2PC snapshot is discarded before commit.
+	// reason is "ttl", "abort", or the reason the leader aborted the round.
 	StagedDropped(collection, reason string)
 
-	// ValidationFailed is called when a user-supplied validator rejects a
-	// fetched or staged value. Emitted at most once per (collection, version);
-	// repeated rejections of the same version are suppressed.
+	// ValidationFailed is called when a validator rejects a fetched or staged
+	// value. Deduped per (collection, version).
 	ValidationFailed(collection string)
+}
 
-	// LeaderAcquired is called when this instance transitions from follower
-	// to leader (i.e. it just acquired the advisory lock for a sync cycle
-	// after not holding it on the previous cycle). Useful for tracking
-	// leadership churn and rolling-deployment leadership handoff.
+// SourceMetrics is an optional interface a Metrics may also satisfy; the manager
+// discards the call otherwise. See docs/sync-protocol.md "Forward-Only Leader".
+type SourceMetrics interface {
+	// SourceVersionRegressed is called when a leader cycle declines a source
+	// version older than the one held. Not deduped: it is the alerting signal.
+	SourceVersionRegressed(collection string)
+}
+
+// LeadershipMetrics is an optional interface a Metrics may also satisfy to
+// observe advisory-lock transitions; the manager discards the calls otherwise.
+type LeadershipMetrics interface {
+	// LeaderAcquired is called when this instance acquires the advisory lock
+	// for a sync cycle after not holding it on the previous one.
 	LeaderAcquired(serviceName string)
 
-	// LeaderLost is called when this instance transitions from leader to
-	// follower (i.e. it failed to acquire the advisory lock on a sync cycle
-	// after holding it on the previous one).
+	// LeaderLost is called when this instance fails to acquire the advisory
+	// lock for a sync cycle after holding it on the previous one.
 	LeaderLost(serviceName string)
 }
 
 // nopMetrics is the default no-op implementation.
 type nopMetrics struct{}
 
-func (nopMetrics) SyncCompleted(string, time.Duration, int) {}
-func (nopMetrics) SyncFailed(string, error)                 {}
-func (nopMetrics) FollowerApplied(string)                   {}
-func (nopMetrics) FollowerFailed(string, error)             {}
-func (nopMetrics) CacheHit(string)                          {}
-func (nopMetrics) CacheMiss(string)                         {}
-func (nopMetrics) StorageLoaded(string)                     {}
-func (nopMetrics) WSEventReceived(string)                   {}
-func (nopMetrics) PreparePhaseStarted(string, string)       {}
-func (nopMetrics) PreparePhaseSucceeded(string, string)     {}
+var (
+	_ Metrics           = nopMetrics{}
+	_ LeadershipMetrics = nopMetrics{}
+	_ SourceMetrics     = nopMetrics{}
+)
+
+func (nopMetrics) SyncCompleted(string, time.Duration, int)  {}
+func (nopMetrics) SyncFailed(string, error)                  {}
+func (nopMetrics) FollowerApplied(string)                    {}
+func (nopMetrics) FollowerFailed(string, error)              {}
+func (nopMetrics) CacheHit(string)                           {}
+func (nopMetrics) CacheMiss(string)                          {}
+func (nopMetrics) StorageLoaded(string)                      {}
+func (nopMetrics) WSEventReceived(string)                    {}
+func (nopMetrics) PreparePhaseStarted(string, string)        {}
+func (nopMetrics) PreparePhaseSucceeded(string, string)      {}
 func (nopMetrics) PreparePhaseFailed(string, string, string) {}
-func (nopMetrics) FollowerPrepared(string)                  {}
-func (nopMetrics) FollowerPrepareFailed(string, error)      {}
-func (nopMetrics) StagedDropped(string, string)             {}
-func (nopMetrics) ValidationFailed(string)                  {}
-func (nopMetrics) LeaderAcquired(string)                    {}
-func (nopMetrics) LeaderLost(string)                        {}
+func (nopMetrics) FollowerPrepared(string)                   {}
+func (nopMetrics) FollowerPrepareFailed(string, error)       {}
+func (nopMetrics) StagedDropped(string, string)              {}
+func (nopMetrics) ValidationFailed(string)                   {}
+func (nopMetrics) LeaderAcquired(string)                     {}
+func (nopMetrics) LeaderLost(string)                         {}
+func (nopMetrics) SourceVersionRegressed(string)             {}
 
 // NopMetrics returns a Metrics implementation that discards all telemetry.
 func NopMetrics() Metrics {

@@ -21,8 +21,10 @@ If the process crashes, Postgres automatically releases session-level advisory l
 ### Snapshot Lifecycle
 
 ```
-pending → active   (ActivateSnapshot: on full confirmation)
-pending → failed   (FailSnapshot: on timeout/error)
+pending → active   (ActivateSnapshot: as soon as the leader decides to move
+                    to the version, before announcing or applying it)
+pending → failed   (FailSnapshot: aborted 2PC round; never applied to a
+                    snapshot that is, or may be, the active one)
 active  → inactive (ActivateSnapshot: old active demoted)
 ```
 
@@ -82,11 +84,28 @@ notifier := redisnotify.NewChannel(redisClient,
 {
     "action": "sync",
     "collection": "businesses",
-    "version": "2025-01-02T10:30:00Z"
+    "version": "2025-01-02T10:30:00Z",
+    "instance_id": "6f1c…"
 }
 ```
 
-Actions: `"sync"` (new version available) or `"rollback"` (revert to active snapshot).
+Actions: `"sync"` (new version available) or `"rollback"` (revert to active snapshot). 2PC adds `"prepare"`, `"commit"`, `"abort"` with a `round_id`.
+
+`instance_id` is the publisher. The manager stamps it on every event it publishes and drops incoming events carrying its own ID — see [Event origin](sync-protocol.md#event-origin). Events without `instance_id` (operator tooling, `director-tools`) are processed by every replica.
+
+### Transport Contract
+
+Both implementations are broadcasts: a published event reaches **every** subscriber on the channel, including a subscription held by the publisher. De-duplicating self-published events belongs to the consumer, not the transport.
+
+Custom `notify.Channel` implementations should be checked against the shared conformance suite:
+
+```go
+notifytest.RunContract(t, func(t *testing.T) (notify.Channel, notify.Channel) {
+    // two instances on the same transport; return the same value twice if
+    // the transport is a single in-process object
+    return newChannel(t), newChannel(t)
+})
+```
 
 ### Who sends notifications?
 
