@@ -2,8 +2,8 @@ package config
 
 import "sort"
 
-// FilterOption transforms a slice of items in a pipeline fashion.
-// Options are applied in order: filter first, then sort, then offset, then limit.
+// FilterOption transforms a slice of items in a pipeline fashion. Nothing reorders the
+// options, so Limit before Where filters the already-truncated slice.
 type FilterOption[T any] func([]T) []T
 
 // Where filters items by a predicate.
@@ -20,9 +20,7 @@ func Where[T any](pred func(T) bool) FilterOption[T] {
 	}
 }
 
-// SortBy sorts items using a comparison function.
-// The cmp function should return a negative number when a < b,
-// zero when a == b, and a positive number when a > b.
+// SortBy sorts items with cmp, which must return <0 for a < b, 0 for a == b, >0 for a > b.
 func SortBy[T any](cmp func(a, b T) int) FilterOption[T] {
 	return func(items []T) []T {
 		result := make([]T, len(items))
@@ -57,8 +55,8 @@ func Offset[T any](n int) FilterOption[T] {
 	}
 }
 
-// applyFilters runs all filter options in sequence.
-// The returned slice is always a new allocation safe to mutate.
+// applyFilters copies up front so options — and the caller — only ever touch a slice
+// the published snapshot does not share.
 func applyFilters[T any](items []T, opts []FilterOption[T]) []T {
 	result := make([]T, len(items))
 	copy(result, items)

@@ -26,15 +26,12 @@ func (i *Items[T]) Collection() string {
 	return i.collection
 }
 
-// Client returns the underlying Directus client. Useful when a caller already
-// holds an Items wrapper and needs ad-hoc REST calls (e.g. ListFields for
-// schema introspection) without re-threading the client.
+// Client returns the underlying Directus client for ad-hoc REST calls.
 func (i *Items[T]) Client() *Client {
 	return i.client
 }
 
-// List fetches items from the collection with optional filtering, sorting, and pagination.
-// Supports relational fields via WithFields (dot notation) and WithDeep for nested queries.
+// List fetches items from the collection, shaped by the given QueryOptions.
 func (i *Items[T]) List(ctx context.Context, opts ...QueryOption) ([]T, error) {
 	query, err := buildQuery(opts)
 	if err != nil {
@@ -55,7 +52,6 @@ func (i *Items[T]) List(ctx context.Context, opts ...QueryOption) ([]T, error) {
 }
 
 // Get fetches a single item by ID.
-// Use WithFields with dot notation to include relational data (e.g. "author.*", "tags.*").
 func (i *Items[T]) Get(ctx context.Context, id string, opts ...QueryOption) (*T, error) {
 	query, err := buildQuery(opts)
 	if err != nil {
@@ -76,7 +72,6 @@ func (i *Items[T]) Get(ctx context.Context, id string, opts ...QueryOption) (*T,
 }
 
 // Create creates a new item in the collection.
-// Relational fields can be set by passing nested objects or IDs in the struct.
 func (i *Items[T]) Create(ctx context.Context, item *T) (*T, error) {
 	raw, err := i.client.Post(ctx, i.path(), item)
 	if err != nil {
@@ -92,7 +87,6 @@ func (i *Items[T]) Create(ctx context.Context, item *T) (*T, error) {
 }
 
 // Update updates an existing item by ID.
-// Relational fields can be updated by passing nested objects or IDs in the struct.
 func (i *Items[T]) Update(ctx context.Context, id string, item *T) (*T, error) {
 	raw, err := i.client.Patch(ctx, i.path()+"/"+id, item)
 	if err != nil {
@@ -116,23 +110,18 @@ func (i *Items[T]) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// MaxDateUpdated fetches the most recent modification timestamp from the collection.
-// It tries date_updated first (sorted desc), falling back to date_created (sorted desc)
-// if no items have been updated yet.
-// This is used for lightweight version detection without fetching all items.
+// MaxDateUpdated returns max(date_updated), else max(date_created), else the zero
+// time, fetching one field of one row. Deleting the newest item makes it decrease.
 func (i *Items[T]) MaxDateUpdated(ctx context.Context) (time.Time, error) {
-	// First try: max(date_updated).
 	t, err := i.fetchMaxTimestamp(ctx, "date_updated")
 	if err == nil && !t.IsZero() {
 		return t, nil
 	}
-	// Field might not exist (403/400) or have no values — fall through.
 
-	// Fallback: max(date_created) — for items that were created but never updated,
-	// or when date_updated field doesn't exist in the schema.
+	// date_updated may be absent from the schema (400/403) or unset on every item.
 	t, err = i.fetchMaxTimestamp(ctx, "date_created")
 	if err != nil {
-		// date_created field might not exist either — not an error, just return zero.
+		// Neither field exists — a collection without timestamps is not an error.
 		return time.Time{}, nil
 	}
 

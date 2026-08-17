@@ -50,18 +50,16 @@ type Flow struct {
 	Options        map[string]any     `json:"options,omitempty"`
 	// Operation is the UUID of the first operation in the chain.
 	Operation *string `json:"operation,omitempty"`
-	// Operations contains the flow's operations.
-	// When fetched with WithFields("*", "operations.*"), these are full Operation objects.
-	// In some responses (e.g. PATCH), they may be just UUID strings.
+	// Operations is polymorphic — full objects under WithFields("*", "operations.*"),
+	// bare UUID strings otherwise (e.g. PATCH) — so decode it with ParseOperations.
 	Operations json.RawMessage `json:"operations,omitempty"`
 
 	DateCreated string `json:"date_created,omitempty"`
 	UserCreated string `json:"user_created,omitempty"`
 }
 
-// ParseOperations parses the Operations field into typed Operation objects.
-// This is needed because the operations field can contain full objects
-// (when using WithFields("*", "operations.*")) or just UUID strings.
+// ParseOperations decodes the Operations field either way. Entries that arrived as
+// bare UUIDs yield Operations with only ID set.
 func (f *Flow) ParseOperations() ([]Operation, error) {
 	if len(f.Operations) == 0 {
 		return nil, nil
@@ -69,7 +67,6 @@ func (f *Flow) ParseOperations() ([]Operation, error) {
 
 	var ops []Operation
 	if err := json.Unmarshal(f.Operations, &ops); err != nil {
-		// Try as string array (UUID list).
 		var ids []string
 		if err2 := json.Unmarshal(f.Operations, &ids); err2 != nil {
 			return nil, fmt.Errorf("directus: parse operations: %w", err)
@@ -310,15 +307,7 @@ type WebhookFlowOptions struct {
 	Async bool `json:"async,omitempty"`
 }
 
-// NewHookFlow creates a flow triggered by database events.
-//
-// Example — trigger on item creation in "products":
-//
-//	directus.NewHookFlow("On Product Create", directus.HookFlowOptions{
-//	    Type:        "action",
-//	    Scope:       []string{"items.create"},
-//	    Collections: []string{"products"},
-//	})
+// NewHookFlow creates an active flow triggered by database events.
 func NewHookFlow(name string, opts HookFlowOptions) Flow {
 	optsMap := map[string]any{
 		"type":  opts.Type,
@@ -338,13 +327,7 @@ func NewHookFlow(name string, opts HookFlowOptions) Flow {
 	}
 }
 
-// NewWebhookFlow creates a flow triggered by an HTTP request.
-//
-// Example:
-//
-//	flow := directus.NewWebhookFlow("External Trigger", directus.WebhookFlowOptions{
-//	    Method: "POST",
-//	})
+// NewWebhookFlow creates an active flow triggered by an HTTP request.
 func NewWebhookFlow(name string, opts WebhookFlowOptions) Flow {
 	optsMap := map[string]any{}
 
@@ -365,13 +348,7 @@ func NewWebhookFlow(name string, opts WebhookFlowOptions) Flow {
 	}
 }
 
-// NewScheduleFlow creates a flow triggered on a cron schedule.
-//
-// Example — run every hour:
-//
-//	directus.NewScheduleFlow("Hourly Cleanup", directus.ScheduleFlowOptions{
-//	    Cron: "0 * * * *",
-//	})
+// NewScheduleFlow creates an active flow triggered on a cron schedule.
 func NewScheduleFlow(name string, opts ScheduleFlowOptions) Flow {
 	return Flow{
 		Name:           name,

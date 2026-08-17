@@ -488,14 +488,13 @@ func TestUpdateFolder_UnmarshalError(t *testing.T) {
 func TestServerHealth_UnmarshalError(t *testing.T) {
 	srv := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		// ServerHealth has fallback behavior - return something that triggers
-		// the unmarshal error but with data that's not a valid ServerHealth
 		w.Write([]byte(`{"data": "not an object"}`))
 	})
 	defer srv.Close()
 
 	client := directus.NewClient(srv.URL, "token")
-	// ServerHealth has a fallback: returns {Status: "ok"} on unmarshal error
+	// Unlike the other endpoints, ServerHealth swallows the unmarshal error and
+	// reports {Status: "ok"}.
 	health, err := client.ServerHealth(context.Background())
 	if err != nil {
 		t.Fatal(err)

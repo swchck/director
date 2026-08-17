@@ -2,6 +2,22 @@
 
 Generic, thread-safe, in-memory config stores with querying, views, and translations.
 
+## Concurrency and panic model
+
+These rules hold for every type in the package.
+
+**Lock-free reads.** A store keeps its state in an immutable snapshot behind an `atomic.Pointer`. Readers load the pointer and never take a lock, so a reader is never blocked by a writer and always sees one coherent snapshot. There is no mutex on the read path -- the `sync.RWMutex` on each type guards only the hook slice.
+
+**Swap publishes before it notifies.** `Collection.Swap` and `Singleton.Swap` install the new snapshot *before* running any `OnChange` hook. The swap is therefore unconditional: a returned error only ever means some hook panicked, never that the data was rejected or rolled back. A caller -- notably `manager` -- must not read a `Swap` error as "the old data is still live", because it is not. Every hook is attempted regardless of earlier failures, and the recovered panics come back joined via `errors.Join`.
+
+**Hooks are recovered, not propagated.** A panic in an `OnChange` callback is caught and converted into that `Swap` error (or routed to the view's `ErrorFunc` for view-level hooks). One bad consumer callback cannot stop the fan-out to the others, and it cannot undo the swap. After a `Swap` returns -- error or not -- the new snapshot is live and every derived view has recomputed.
+
+**Defensive copies isolate the snapshot, not the hooks.** Hooks receive copies of the old and new data so that mutating an argument cannot corrupt the published snapshot. Those copies are *shared between hooks* in the same fan-out, so hooks are not isolated from each other: a hook that mutates its argument is visible to later hooks.
+
+**Recompute is synchronous, persistence is not.** Views recompute inside the source's hook chain, so all derived views are current by the time `Swap` returns. Persistence writes run in background goroutines behind a small semaphore (`defaultPersistenceMaxConcurrency`); when the semaphore is full a save is *silently skipped*, on the grounds that the next `Swap` produces a fresh one anyway.
+
+**Caller-supplied functions.** Predicates and comparison functions passed to read methods run on the caller's goroutine and are **not** recovered -- a panic in one propagates to the caller. A panic in a view's key, transform, or extract function propagates out of the view constructor; once the view is subscribed, the same panic is recovered by the source's hook recovery and surfaces as a `Swap` error.
+
 ## Collection[T] (`collection.go`)
 
 Holds multiple items of type T. All reads are lock-free via `atomic.Pointer`.
@@ -119,6 +135,8 @@ view := config.NewView("food-sorted", businesses, filters,
 ```
 
 Persistence writes are **asynchronous** -- they do not block the view update. On startup, the view loads from persistence for a warm start before the first sync completes.
+
+A loaded snapshot stands only while the source is still unloaded. As soon as the source has a version -- from cache, storage, or the source itself -- the view is computed from it and the loaded snapshot is discarded, however stale or empty the source turns out to be: a view is a function of its source, never an independent copy. A view serving a warm start reports the zero `Version()`, which is how a consumer tells warm data from synced data -- on the view types that expose `Version()`; see "Close and Version" below. Note that `Manager.Ready()` reads the *source* version, so a warm-started view never makes a replica look ready.
 
 ### ViewPersistence Interface
 
@@ -338,10 +356,9 @@ allLevels := config.NewRelatedView("levels", businesses, extractFn,
 
 ## Close and Version
 
-All view types (`View`, `SingletonView`, `IndexedView`, `IndexedViewT`, `TranslatedView`, `RelatedView`) support:
+**`Close()`** is available on every subscribing view type (`View`, `SingletonView`, `IndexedView`, `IndexedViewT`, `TranslatedView`, `RelatedView`). It unsubscribes from the source, so the view stops recomputing on source changes; reads remain valid but return stale data. Safe to call multiple times. `CompositeView` subscribes to nothing and so has no `Close`.
 
-- **`Close()`** — unsubscribes from the source. The view stops recomputing on source changes. Reads remain valid but return stale data. Safe to call multiple times.
-- **`Version()`** — returns the current snapshot version, matching the source's version at the time of the last recomputation.
+**`Version()`** — the current snapshot version, matching the source's version at the last recomputation — is exported only by `View`, `TranslatedView`, and `RelatedView`. `SingletonView`, `IndexedView`, and `IndexedViewT` track a version internally but do not expose it, so a warm start is not observable on those three.
 
 ```go
 view := config.NewView("items", collection, filters)
@@ -367,6 +384,25 @@ func processItems(src config.ReadableCollection[Product]) {
 ## Version (`version.go`)
 
 Opaque version type based on `date_updated` timestamps. RFC3339 format ensures deterministic comparison across replicas -- same source data produces the same version string everywhere.
+
+## diff (`config/diff/`)
+
+Classifies items between two slices so an `OnChange` consumer can react only to what actually changed:
+
+```go
+products.OnChange(func(old, new []Product) {
+    added, updated, removed := diff.By(old, new, func(p Product) int { return p.ID })
+    for _, p := range added   { publish("product.created", p) }
+    for _, p := range updated { publish("product.updated", p) }
+    for _, p := range removed { publish("product.deleted", p) }
+})
+```
+
+- `added` -- keys present in `new` but not in `old`.
+- `updated` -- keys present in both, values differing under `reflect.DeepEqual`; returned with their **new** values. Look the key up in `old` to compare against the previous value.
+- `removed` -- keys present in `old` but not in `new`.
+
+Order within each result slice is unspecified, and keys must be unique within each slice -- with duplicate keys the result is unspecified. `diff.ByEqual` takes an explicit `equal(old, new) bool` predicate instead, for comparing only selected fields or avoiding reflection.
 
 ## Full View Type Summary
 

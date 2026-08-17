@@ -15,7 +15,6 @@ func TestE2E_FlowCRUDLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Create a webhook flow.
 	flow := directus.NewWebhookFlow("E2E Test Flow", directus.WebhookFlowOptions{
 		Method: "POST",
 	})
@@ -43,7 +42,6 @@ func TestE2E_FlowCRUDLifecycle(t *testing.T) {
 
 	t.Logf("created flow: id=%s", created.ID)
 
-	// Get flow by ID.
 	got, err := dc.GetFlow(ctx, created.ID)
 	if err != nil {
 		t.Fatalf("get flow: %v", err)
@@ -53,7 +51,6 @@ func TestE2E_FlowCRUDLifecycle(t *testing.T) {
 		t.Errorf("get: name = %q", got.Name)
 	}
 
-	// Update flow.
 	updated, err := dc.UpdateFlow(ctx, created.ID, directus.Flow{
 		Name:        "E2E Updated Flow",
 		Description: "Updated via API",
@@ -66,7 +63,6 @@ func TestE2E_FlowCRUDLifecycle(t *testing.T) {
 		t.Errorf("update: name = %q", updated.Name)
 	}
 
-	// List flows.
 	flows, err := dc.ListFlows(ctx)
 	if err != nil {
 		t.Fatalf("list flows: %v", err)
@@ -84,12 +80,10 @@ func TestE2E_FlowCRUDLifecycle(t *testing.T) {
 		t.Error("created flow not in list")
 	}
 
-	// Delete.
 	if err := dc.DeleteFlow(ctx, created.ID); err != nil {
 		t.Fatalf("delete flow: %v", err)
 	}
 
-	// Verify deleted.
 	_, err = dc.GetFlow(ctx, created.ID)
 	if err == nil {
 		t.Error("expected error after delete, got nil")
@@ -101,7 +95,6 @@ func TestE2E_FlowWithOperations(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Create a manual flow.
 	flow := directus.NewManualFlow("E2E Flow With Ops")
 	createdFlow, err := dc.CreateFlow(ctx, flow)
 	if err != nil {
@@ -112,7 +105,6 @@ func TestE2E_FlowWithOperations(t *testing.T) {
 		_ = dc.DeleteFlow(context.Background(), createdFlow.ID)
 	})
 
-	// Create a log operation.
 	logOp := directus.NewLogOperation("log_step", "Hello from e2e test")
 	logOp.Flow = createdFlow.ID
 	logOp.PositionX = 20
@@ -167,7 +159,6 @@ func TestE2E_FlowWithOperations(t *testing.T) {
 		t.Fatalf("chain operations: %v", err)
 	}
 
-	// Verify the full flow with operations.
 	fullFlow, err := dc.GetFlow(ctx, createdFlow.ID,
 		directus.WithFields("*", "operations.*"),
 	)
@@ -188,7 +179,6 @@ func TestE2E_FlowWithOperations(t *testing.T) {
 		t.Errorf("flow has %d operations, want 2", len(parsedOps))
 	}
 
-	// Verify chain via GetOperation.
 	chainedOp, err := dc.GetOperation(ctx, createdOp.ID)
 	if err != nil {
 		t.Fatalf("get chained operation: %v", err)
@@ -224,7 +214,6 @@ func TestE2E_HookFlow(t *testing.T) {
 		t.Errorf("trigger = %q, want 'hook'", created.Trigger)
 	}
 
-	// Verify options were stored.
 	got, err := dc.GetFlow(ctx, created.ID)
 	if err != nil {
 		t.Fatalf("get flow: %v", err)

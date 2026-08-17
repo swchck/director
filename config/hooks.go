@@ -5,7 +5,6 @@ import (
 	"fmt"
 )
 
-// safeCallHook executes a single function and recovers any panic, returning it as an error.
 func safeCallHook(fn func()) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -18,9 +17,8 @@ func safeCallHook(fn func()) (err error) {
 	return nil
 }
 
-// safeCallHooks executes all provided functions, recovering panics from each individually.
-// All hooks run regardless of whether earlier hooks panic. Returns a joined error
-// containing all panic errors, or nil if no hooks panicked.
+// safeCallHooks runs every hook even if an earlier one panicked, so one bad consumer
+// callback cannot stop the rest of the fan-out. Panics come back joined.
 func safeCallHooks(hooks ...func()) error {
 	var errs []error
 	for _, fn := range hooks {

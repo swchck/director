@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -30,7 +31,6 @@ func TestIndexedView_GroupByCategory(t *testing.T) {
 		func(b articleWithTag) string { return b.Category },
 	)
 
-	// Check counts.
 	if byCategory.Count() != 2 {
 		t.Errorf("Count() = %d, want 2 (food, drink)", byCategory.Count())
 	}
@@ -43,7 +43,6 @@ func TestIndexedView_GroupByCategory(t *testing.T) {
 		t.Errorf("CountFor(drink) = %d, want 1", byCategory.CountFor("drink"))
 	}
 
-	// Get items by key.
 	food := byCategory.Get("food")
 	if len(food) != 3 {
 		t.Fatalf("Get(food) = %d items, want 3", len(food))
@@ -58,18 +57,15 @@ func TestIndexedView_GroupByCategory(t *testing.T) {
 		t.Errorf("food names = %v", names)
 	}
 
-	// Non-existent key.
 	if byCategory.Get("retail") != nil {
 		t.Error("Get(retail) should be nil")
 	}
 
-	// Keys.
 	keys := byCategory.Keys()
 	if len(keys) != 2 {
 		t.Errorf("Keys() = %v, want 2 keys", keys)
 	}
 
-	// All.
 	all := byCategory.All()
 	if len(all) != 2 {
 		t.Errorf("All() has %d keys, want 2", len(all))
@@ -621,4 +617,225 @@ func TestIndexedView_OnChange_PanicRecovery(t *testing.T) {
 	if !byCategory.Has("drinks") {
 		t.Error("expected drinks category after swap")
 	}
+}
+
+// Warm start tests
+
+func TestIndexedView_WithPersistence_WarmStart(t *testing.T) {
+	stored := storedIndex(t, map[string][]articleWithTag{"food": {{ID: 7}, {ID: 8}}})
+
+	tests := []struct {
+		name      string
+		stored    []byte
+		sourceVer config.Version
+		source    []articleWithTag
+		wantKeys  map[string]int // key -> item count
+	}{
+		{
+			name:     "stored index stands while the source is unloaded",
+			stored:   stored,
+			wantKeys: map[string]int{"food": 2},
+		},
+		{
+			name:      "a loaded source wins over a stale index",
+			stored:    stored,
+			sourceVer: v1(),
+			source:    []articleWithTag{{ID: 1, Category: "drink"}},
+			wantKeys:  map[string]int{"drink": 1},
+		},
+		{
+			name:      "a source that synced empty wins over an index",
+			stored:    stored,
+			sourceVer: v1(),
+			wantKeys:  map[string]int{},
+		},
+		{
+			name:     "no stored entry leaves the index computed from the source",
+			wantKeys: map[string]int{},
+		},
+		{
+			name:     "a stored null is not a warm start",
+			stored:   []byte("null"),
+			wantKeys: map[string]int{},
+		},
+		{
+			name:     "a stored empty index is a warm start",
+			stored:   []byte("{}"),
+			wantKeys: map[string]int{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &mockIndexPersistence{data: make(map[string][]byte)}
+			if tc.stored != nil {
+				store.data["warm"] = tc.stored
+			}
+
+			c := config.NewCollection[articleWithTag]("articles")
+			if !tc.sourceVer.IsZero() {
+				_ = c.Swap(tc.sourceVer, tc.source)
+			}
+
+			iv := config.NewIndexedView("warm", c,
+				func(a articleWithTag) string { return a.Category },
+				config.WithIndexPersistence[articleWithTag, string](store),
+			)
+
+			if iv.Count() != len(tc.wantKeys) {
+				t.Fatalf("Count() = %d, want %d (keys %v)", iv.Count(), len(tc.wantKeys), iv.Keys())
+			}
+
+			for key, want := range tc.wantKeys {
+				if got := iv.CountFor(key); got != want {
+					t.Errorf("CountFor(%q) = %d, want %d", key, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestIndexedView_WithPersistence_WarmStartSupersededByFirstSwap(t *testing.T) {
+	store := &mockIndexPersistence{data: map[string][]byte{
+		"warm": storedIndex(t, map[string][]articleWithTag{"food": {{ID: 7}}}),
+	}}
+
+	c := config.NewCollection[articleWithTag]("articles")
+	iv := config.NewIndexedView("warm", c,
+		func(a articleWithTag) string { return a.Category },
+		config.WithIndexPersistence[articleWithTag, string](store),
+	)
+
+	if !iv.Has("food") {
+		t.Fatal("Has(food) before first sync = false, want the warm-started key")
+	}
+
+	_ = c.Swap(v1(), []articleWithTag{{ID: 1, Category: "drink"}})
+
+	if iv.Has("food") {
+		t.Error("Has(food) after first sync = true, want the warm start superseded")
+	}
+
+	if !iv.Has("drink") {
+		t.Error("Has(drink) after first sync = false, want the synced key")
+	}
+}
+
+func TestIndexedViewT_WithPersistence_WarmStart(t *testing.T) {
+	stored := storedIndexT(t, map[string][]tag{"Pizza": {{ID: 7}, {ID: 8}}})
+
+	tests := []struct {
+		name      string
+		stored    []byte
+		sourceVer config.Version
+		source    []articleWithTag
+		wantKeys  map[string]int // key -> value count
+	}{
+		{
+			name:     "stored index stands while the source is unloaded",
+			stored:   stored,
+			wantKeys: map[string]int{"Pizza": 2},
+		},
+		{
+			name:      "a loaded source wins over a stale index",
+			stored:    stored,
+			sourceVer: v1(),
+			source:    []articleWithTag{{ID: 1, Name: "Coffee", Tags: []tag{{ID: 1}}}},
+			wantKeys:  map[string]int{"Coffee": 1},
+		},
+		{
+			name:      "a source that synced empty wins over an index",
+			stored:    stored,
+			sourceVer: v1(),
+			wantKeys:  map[string]int{},
+		},
+		{
+			name:     "no stored entry leaves the index computed from the source",
+			wantKeys: map[string]int{},
+		},
+		{
+			name:     "a stored null is not a warm start",
+			stored:   []byte("null"),
+			wantKeys: map[string]int{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &mockIndexPersistence{data: make(map[string][]byte)}
+			if tc.stored != nil {
+				store.data["warm"] = tc.stored
+			}
+
+			c := config.NewCollection[articleWithTag]("articles")
+			if !tc.sourceVer.IsZero() {
+				_ = c.Swap(tc.sourceVer, tc.source)
+			}
+
+			ivt := config.NewIndexedViewT("warm", c,
+				func(a articleWithTag) string { return a.Name },
+				func(a articleWithTag) []tag { return a.Tags },
+				config.WithIndexTPersistence[articleWithTag, string, tag](store),
+			)
+
+			if ivt.Count() != len(tc.wantKeys) {
+				t.Fatalf("Count() = %d, want %d (keys %v)", ivt.Count(), len(tc.wantKeys), ivt.Keys())
+			}
+
+			for key, want := range tc.wantKeys {
+				if got := ivt.CountFor(key); got != want {
+					t.Errorf("CountFor(%q) = %d, want %d", key, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestIndexedViewT_WithPersistence_WarmStartSupersededByFirstSwap(t *testing.T) {
+	store := &mockIndexPersistence{data: map[string][]byte{
+		"warm": storedIndexT(t, map[string][]tag{"Pizza": {{ID: 7}}}),
+	}}
+
+	c := config.NewCollection[articleWithTag]("articles")
+	ivt := config.NewIndexedViewT("warm", c,
+		func(a articleWithTag) string { return a.Name },
+		func(a articleWithTag) []tag { return a.Tags },
+		config.WithIndexTPersistence[articleWithTag, string, tag](store),
+	)
+
+	if !ivt.Has("Pizza") {
+		t.Fatal("Has(Pizza) before first sync = false, want the warm-started key")
+	}
+
+	_ = c.Swap(v1(), []articleWithTag{{ID: 1, Name: "Coffee", Tags: []tag{{ID: 1}}}})
+
+	if ivt.Has("Pizza") {
+		t.Error("Has(Pizza) after first sync = true, want the warm start superseded")
+	}
+
+	if !ivt.Has("Coffee") {
+		t.Error("Has(Coffee) after first sync = false, want the synced key")
+	}
+}
+
+func storedIndex(t *testing.T, index map[string][]articleWithTag) []byte {
+	t.Helper()
+
+	data, err := json.Marshal(index)
+	if err != nil {
+		t.Fatalf("marshal stored index: %v", err)
+	}
+
+	return data
+}
+
+func storedIndexT(t *testing.T, index map[string][]tag) []byte {
+	t.Helper()
+
+	data, err := json.Marshal(index)
+	if err != nil {
+		t.Fatalf("marshal stored index: %v", err)
+	}
+
+	return data
 }

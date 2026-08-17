@@ -90,8 +90,7 @@ func (r *Registry) Deregister(ctx context.Context, instanceID string) error {
 	return nil
 }
 
-// AliveCount returns the number of instances with a heartbeat newer than
-// the stale threshold.
+// AliveCount counts instances of a service whose heartbeat is within the threshold.
 func (r *Registry) AliveCount(ctx context.Context, serviceName string) (int, error) {
 	const query = `
 		SELECT COUNT(*)
@@ -108,8 +107,7 @@ func (r *Registry) AliveCount(ctx context.Context, serviceName string) (int, err
 	return count, nil
 }
 
-// DeleteStaleInstances removes instance rows whose last_heartbeat is older
-// than olderThan, regardless of service. Returns the number of rows deleted.
+// DeleteStaleInstances deletes instance rows last seen before olderThan.
 func (r *Registry) DeleteStaleInstances(ctx context.Context, olderThan time.Time) (int, error) {
 	const query = `DELETE FROM director.config_instances WHERE last_heartbeat < $1`
 
@@ -121,8 +119,7 @@ func (r *Registry) DeleteStaleInstances(ctx context.Context, olderThan time.Time
 	return int(tag.RowsAffected()), nil
 }
 
-// AliveInstances returns the instance IDs with a heartbeat newer than the
-// stale threshold for the given service name.
+// AliveInstances lists instances of a service whose heartbeat is within the threshold.
 func (r *Registry) AliveInstances(ctx context.Context, serviceName string) ([]string, error) {
 	const query = `
 		SELECT instance_id

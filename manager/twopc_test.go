@@ -16,11 +16,8 @@ import (
 
 // -- 2PC-specific helpers --------------------------------------------------
 
-// twoPCNotifier extends the basic mockNotifier with a pluggable hook so tests
-// can react to prepare events by writing follower statuses directly into
-// mockStorage (simulating remote followers). failPublish, when non-nil, returns
-// an error to simulate a broken notify channel (e.g. for verifying the leader
-// stays consistent when commit notification can't be delivered).
+// twoPCNotifier adds a hook so tests can answer prepare events by writing follower
+// statuses into mockStorage, plus failPublish to simulate a broken notify channel.
 type twoPCNotifier struct {
 	*mockNotifier
 	onPublish   func(context.Context, notify.Event)
@@ -34,8 +31,8 @@ func newTwoPCNotifier() *twoPCNotifier {
 func (n *twoPCNotifier) Publish(ctx context.Context, event notify.Event) error {
 	if n.failPublish != nil {
 		if err := n.failPublish(event); err != nil {
-			// Still record so tests can assert what was attempted.
-			_ = n.mockNotifier.Publish(ctx, event)
+			// Nothing is delivered, but record so tests see what was attempted.
+			n.record(event)
 			return err
 		}
 	}
@@ -106,9 +103,8 @@ func (s *twoPCSource) LastModified(_ context.Context) (time.Time, error) {
 	return s.lastModified, nil
 }
 
-// buildManager wires a manager with 2PC enabled (instance ID "leader") and
-// the provided registry/notifier. The source and collection are returned so
-// tests can assert end-state.
+// build2PCManager wires a manager with 2PC enabled and instance ID "leader",
+// returning the collection so tests can assert the end state.
 func build2PCManager(
 	t *testing.T,
 	store *mockStorage,
@@ -169,7 +165,6 @@ func TestTwoPC_HappyPath(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- mgr.Start(ctx) }()
 
-	// Wait for the round to complete.
 	waitFor(t, 3*time.Second, func() bool {
 		return articles.Count() == 2
 	})
@@ -178,7 +173,6 @@ func TestTwoPC_HappyPath(t *testing.T) {
 		t.Fatalf("articles.Count() = %d, want 2", articles.Count())
 	}
 
-	// Verify commit was published.
 	var sawCommit bool
 	for _, ev := range notif.publishedEvents() {
 		if ev.Action == notify.ActionCommit {
@@ -237,7 +231,6 @@ func TestTwoPC_AbortsOnPrepareFailed(t *testing.T) {
 		t.Errorf("leader version advanced to %q despite abort", articles.Version())
 	}
 
-	// An abort event should have been published.
 	var sawAbort, sawCommit bool
 	for _, ev := range notif.publishedEvents() {
 		switch ev.Action {
@@ -254,7 +247,6 @@ func TestTwoPC_AbortsOnPrepareFailed(t *testing.T) {
 		t.Error("did NOT expect a commit event on abort")
 	}
 
-	// Snapshot should be marked failed.
 	version := config.NewVersion(now).String()
 	snap, _ := store.GetSnapshot(ctx, "articles", version)
 	if snap == nil {
@@ -465,7 +457,6 @@ func TestTwoPC_FollowerPrepareAndCommit(t *testing.T) {
 		t.Fatalf("SaveSnapshot: %v", err)
 	}
 
-	// Send a prepare.
 	notif.subCh <- notify.Event{
 		Action:     notify.ActionPrepare,
 		Collection: "articles",
@@ -473,7 +464,6 @@ func TestTwoPC_FollowerPrepareAndCommit(t *testing.T) {
 		RoundID:    "round-xyz",
 	}
 
-	// Wait for follower to log "prepared".
 	waitFor(t, 2*time.Second, func() bool {
 		ids, _ := store.AppliedInstances(ctx, "articles", version, "prepared")
 		return slices.Contains(ids, "solo-follower")
@@ -484,7 +474,6 @@ func TestTwoPC_FollowerPrepareAndCommit(t *testing.T) {
 		t.Errorf("follower applied data during prepare phase: Count=%d", articles.Count())
 	}
 
-	// Send commit.
 	notif.subCh <- notify.Event{
 		Action:     notify.ActionCommit,
 		Collection: "articles",
@@ -561,7 +550,6 @@ func TestTwoPC_FollowerAbortDropsStaged(t *testing.T) {
 		RoundID:    "round-abort",
 	}
 
-	// Now send a commit for the same round — should be a no-op (staged gone).
 	notif.subCh <- notify.Event{
 		Action:     notify.ActionCommit,
 		Collection: "articles",
@@ -569,16 +557,10 @@ func TestTwoPC_FollowerAbortDropsStaged(t *testing.T) {
 		RoundID:    "round-abort",
 	}
 
-	// But snapshot in storage exists, so fallback swap may happen. The test
-	// asserts that after abort the follower does not CURRENTLY hold a staged
-	// entry — the commit after abort is allowed to fall back to storage and
-	// apply (because the follower already logged "prepared"). We only verify
-	// the abort event doesn't leave dangling state that would crash.
+	// A commit after the abort legitimately falls back to storage and applies: this
+	// follower logged "prepared". Asserted is only that abort left nothing behind.
 	time.Sleep(500 * time.Millisecond)
 
-	// The snapshot exists in storage, so after commit-with-fallback the
-	// collection WILL contain one item. That's expected behavior per the
-	// design: an already-prepared follower honors commit via storage fallback.
 	if articles.Count() != 1 {
 		t.Logf("commit after abort fell back to storage, count=%d (expected if storage fallback applied)", articles.Count())
 	}
@@ -587,12 +569,13 @@ func TestTwoPC_FollowerAbortDropsStaged(t *testing.T) {
 	<-errCh
 }
 
-// TestTwoPC_StagedTTLExpires: a staged entry expires when no commit/abort
-// arrives within PrepareTTL.
+// TestTwoPC_StagedTTLExpires: an uncommitted staged entry is dropped on the reconcile
+// tick, and a later commit still honours the "prepared" this replica logged.
 func TestTwoPC_StagedTTLExpires(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 
 	store := newMockStorage()
+	store.lockHeld = true // another instance is leader, so only follower paths run here
 	reg := newTwoPCRegistry("solo-follower")
 
 	src := &twoPCSource{
@@ -601,26 +584,31 @@ func TestTwoPC_StagedTTLExpires(t *testing.T) {
 	}
 
 	notif := newMockNotifier()
+	logger := &captureLogger{}
+	metrics := &recordingMetrics{}
 	articles := config.NewCollection[twoPCArticle]("articles")
 
 	mgr := manager.New(store, notif, reg, manager.Options{
 		PollInterval:             time.Hour,
+		HeartbeatInterval:        20 * time.Millisecond, // reconcile tick sweeps expired stages
 		WaitConfirmationsTimeout: 500 * time.Millisecond,
-		PrepareTTL:               300 * time.Millisecond, // very short TTL
+		PrepareTTL:               100 * time.Millisecond, // very short TTL
 		ServiceName:              "test-svc",
 		RequireUnanimousApply:    true,
 	},
 		manager.WithInstanceID("solo-follower"),
+		manager.WithLogger(logger),
+		manager.WithMetrics(metrics),
 	)
 	manager.RegisterCollectionSource(mgr, articles, src)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- mgr.Start(ctx) }()
 
-	time.Sleep(200 * time.Millisecond)
+	waitFor(t, 5*time.Second, func() bool { return logger.startedCount() > 0 })
 
 	version := config.NewVersion(now.Add(time.Hour)).String()
 	content, _ := json.Marshal([]twoPCArticle{{ID: 7, Name: "WillExpire"}})
@@ -635,10 +623,13 @@ func TestTwoPC_StagedTTLExpires(t *testing.T) {
 		RoundID:    "round-ttl",
 	}
 
-	// Wait past TTL.
-	time.Sleep(1 * time.Second)
+	waitFor(t, 5*time.Second, func() bool { return metrics.stagedDroppedCount("articles:ttl") == 1 })
 
-	// Commit now — staged should be expired; fallback from storage will apply.
+	if got := metrics.stagedDroppedCount("articles:ttl"); got != 1 {
+		t.Fatalf("StagedDropped(ttl) = %d, want 1 — the abandoned staged value was never dropped", got)
+	}
+
+	// Commit now — staged is gone; fallback from storage must apply.
 	notif.subCh <- notify.Event{
 		Action:     notify.ActionCommit,
 		Collection: "articles",
@@ -650,6 +641,9 @@ func TestTwoPC_StagedTTLExpires(t *testing.T) {
 
 	if articles.Count() != 1 {
 		t.Errorf("after TTL + commit, expected fallback apply, Count=%d", articles.Count())
+	}
+	if got := logger.warnCount("staged entry missing on commit"); got != 1 {
+		t.Errorf("storage fallback warnings = %d, want 1", got)
 	}
 
 	cancel()
@@ -800,7 +794,6 @@ func TestTwoPC_Singleton_AbortsOnPrepareFailed(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- mgr.Start(ctx) }()
 
-	// Wait for abort to be published.
 	waitFor(t, 3*time.Second, func() bool {
 		for _, ev := range notif.publishedEvents() {
 			if ev.Action == notify.ActionAbort {
@@ -824,7 +817,6 @@ func TestTwoPC_Singleton_AbortsOnPrepareFailed(t *testing.T) {
 		t.Error("did NOT expect a commit event on singleton abort")
 	}
 
-	// Snapshot must be marked failed.
 	version := config.NewVersion(now).String()
 	snap, _ := store.GetSnapshot(ctx, "profile", version)
 	if snap == nil {
@@ -992,9 +984,8 @@ func TestTwoPC_MultipleCollections_HappyPath(t *testing.T) {
 	<-errCh
 }
 
-// TestTwoPC_MultipleCollections_PartialAbort: one collection's follower fails
-// to prepare while the other succeeds. The healthy collection MUST still
-// commit independently — failures don't cascade across collections.
+// TestTwoPC_MultipleCollections_PartialAbort: one collection's follower fails to
+// prepare; the healthy one MUST still commit, since failures do not cascade.
 func TestTwoPC_MultipleCollections_PartialAbort(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 
@@ -1092,10 +1083,8 @@ func TestTwoPC_MultipleCollections_PartialAbort(t *testing.T) {
 
 // -- Resilience: leader stays consistent if commit notification fails ------
 
-// TestTwoPC_PublishCommitFailure_LeaderStillCommits: if publishing the commit
-// event to the notify channel fails, the leader still applies locally and
-// activates the snapshot. Followers will re-converge via storage on next
-// poll/restart. This documents and pins the partial-failure behavior.
+// TestTwoPC_PublishCommitFailure_LeaderStillCommits: a failed commit publish still
+// leaves the leader applied and activated; followers re-converge via storage.
 func TestTwoPC_PublishCommitFailure_LeaderStillCommits(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 
@@ -1148,10 +1137,8 @@ func TestTwoPC_PublishCommitFailure_LeaderStillCommits(t *testing.T) {
 	<-errCh
 }
 
-// TestTwoPC_UnknownCollectionPrepareACK verifies that a follower receiving
-// a prepare for a collection it doesn't manage logs "prepared" instead of
-// silently ignoring the event. This prevents 2PC deadlocks during rolling
-// deployments that add new collections.
+// TestTwoPC_UnknownCollectionPrepareACK: a follower must log "prepared" for a
+// collection it does not manage, or a rolling deploy adding one deadlocks rounds.
 func TestTwoPC_UnknownCollectionPrepareACK(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 
@@ -1196,7 +1183,6 @@ func TestTwoPC_UnknownCollectionPrepareACK(t *testing.T) {
 		RoundID:    "round-unknown",
 	}
 
-	// The follower should log "prepared" for the unknown collection.
 	waitFor(t, 2*time.Second, func() bool {
 		ids, _ := store.AppliedInstances(ctx, "new-products", unknownVersion, "prepared")
 		return slices.Contains(ids, "follower")
@@ -1261,10 +1247,8 @@ func TestTwoPC_UnknownCollectionCommitIgnored(t *testing.T) {
 		RoundID:    "round-unknown",
 	}
 
-	// Give events time to be processed.
 	time.Sleep(300 * time.Millisecond)
 
-	// No committed status should be logged for unknown collection.
 	ids, _ := store.AppliedInstances(ctx, "unknown-col", config.NewVersion(now).String(), "committed")
 	if len(ids) != 0 {
 		t.Errorf("unexpected committed status for unknown collection: %v", ids)
@@ -1274,9 +1258,8 @@ func TestTwoPC_UnknownCollectionCommitIgnored(t *testing.T) {
 	<-errCh
 }
 
-// TestTwoPC_RollingDeployNewCollection simulates a rolling deployment scenario:
-// the leader registers a new collection that followers don't know about.
-// With the unknown-collection ACK, the 2PC round must succeed.
+// TestTwoPC_RollingDeployNewCollection: the leader registers a collection followers do
+// not know about, and the unknown-collection ACK must let the round succeed.
 func TestTwoPC_RollingDeployNewCollection(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 
@@ -1320,7 +1303,6 @@ func TestTwoPC_RollingDeployNewCollection(t *testing.T) {
 		t.Fatalf("articles.Count() = %d, want 1 (rolling deploy new collection)", articles.Count())
 	}
 
-	// Verify commit was published.
 	var sawCommit bool
 	for _, ev := range notif.publishedEvents() {
 		if ev.Action == notify.ActionCommit {
@@ -1338,6 +1320,32 @@ func TestTwoPC_RollingDeployNewCollection(t *testing.T) {
 
 // -- small helpers ---------------------------------------------------------
 
+// startManager runs mgr until the test ends, blocking until its run loop is up so setup
+// cannot race startup. The returned stop is idempotent and also registered as cleanup.
+func startManager(t *testing.T, mgr *manager.Manager, logger *captureLogger) func() {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.Start(ctx) }()
+
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			<-errCh
+		})
+	}
+	t.Cleanup(stop)
+
+	waitFor(t, 5*time.Second, func() bool { return logger.startedCount() > 0 })
+	if logger.startedCount() == 0 {
+		t.Fatal("manager never started")
+	}
+
+	return stop
+}
+
 func waitFor(t *testing.T, timeout time.Duration, predicate func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -1349,5 +1357,4 @@ func waitFor(t *testing.T, timeout time.Duration, predicate func() bool) {
 	}
 }
 
-// Sanity: ensure errors package is used (some compilers strip unused imports).
 var _ = errors.New

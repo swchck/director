@@ -32,9 +32,8 @@ type ConfigStatus struct {
 	// for singletons.
 	ItemCount int
 
-	// LastSyncAt is the wall-clock time of the most recent sync attempt
-	// (success or failure) targeting this config. Zero before the first
-	// attempt completes.
+	// LastSyncAt is when the most recent sync attempt for this config completed,
+	// successful or not. Zero before the first attempt.
 	LastSyncAt time.Time
 
 	// LastSyncErr is the error message from the most recent sync attempt.
@@ -42,14 +41,8 @@ type ConfigStatus struct {
 	LastSyncErr string
 }
 
-// Status reports the runtime state of the manager and all registered configs.
-//
-// Intended for /healthz/details endpoints, debug pages, and incident response
-// — somewhere a human can see which collections are loaded, on what version,
-// and whether the most recent sync succeeded.
-//
-// The returned value is a read-only snapshot. Calling Status does not block
-// readers, sync cycles, or 2PC rounds.
+// Status is a read-only snapshot of the manager and its configs, for
+// /healthz/details, debug pages and incident response. Reading it blocks nothing.
 type Status struct {
 	// InstanceID is the unique identifier of this Manager instance.
 	InstanceID string
@@ -61,14 +54,12 @@ type Status struct {
 	// poll-based sync is disabled and only SyncNow advances state.
 	ManualSync bool
 
-	// Strict2PC is true when Options.RequireUnanimousApply was set — the
-	// cluster runs strict 2PC instead of the default eventually-consistent
-	// protocol.
+	// Strict2PC is true when Options.RequireUnanimousApply was set — the cluster
+	// runs strict 2PC rather than the eventually-consistent protocol.
 	Strict2PC bool
 
-	// IsLeader reports whether this instance held the advisory lock at the
-	// last sync attempt. Best-effort signal: leadership is reacquired on
-	// every poll, so a transient false during a poll cycle is normal.
+	// IsLeader reports whether this instance held the advisory lock at the last
+	// sync attempt. Best-effort: leadership is reattempted every cycle.
 	IsLeader bool
 
 	// Configs lists every registered config sorted by Name for deterministic
@@ -76,11 +67,8 @@ type Status struct {
 	Configs []ConfigStatus
 }
 
-// Status returns a read-only snapshot of the manager's runtime state.
-//
-// Safe to call from any goroutine, before or after Start. Before Start
-// returns, IsLeader is false and per-config LastSyncAt is zero. After Start,
-// the returned slice reflects the most recent sync activity.
+// Status returns a read-only snapshot of the manager's runtime state. Safe from any
+// goroutine; before Start, IsLeader is false and every LastSyncAt is zero.
 func (m *Manager) Status() Status {
 	m.syncStateMu.RLock()
 	syncStates := make(map[string]syncStateEntry, len(m.syncState))

@@ -209,15 +209,9 @@ func TestE2E_TwoPhaseCommit_HappyPath(t *testing.T) {
 	<-errB
 }
 
-// TestE2E_TwoPhaseCommit_AbortOnBrokenReplica: replica B uses a flakyStorage
-// that fails GetSnapshot during the broken window — simulating a follower
-// whose snapshot read fails during 2PC prepare. The leader must abort and
-// neither replica may advance. After flaky behavior is disabled, both
-// replicas converge on the new version.
-//
-// In 2PC, followers don't call their source.List() during prepare — they
-// load the snapshot from storage. So a realistic "broken follower" is one
-// whose storage read fails (corrupt snapshot, transient pg error, etc.).
+// TestE2E_TwoPhaseCommit_AbortOnBrokenReplica: while replica B's snapshot read
+// fails, the leader must abort and neither replica may advance; once B recovers,
+// both converge on the new version.
 func TestE2E_TwoPhaseCommit_AbortOnBrokenReplica(t *testing.T) {
 	const (
 		collection  = "tpc_e2e_abort"
@@ -355,5 +349,4 @@ func waitUntil(timeout time.Duration, predicate func() bool) bool {
 	return predicate()
 }
 
-// silence unused import warnings if compiler ever strips them
 var _ = notify.ActionPrepare

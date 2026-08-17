@@ -13,13 +13,15 @@ var (
 )
 
 // Status represents the lifecycle state of a config snapshot.
+// Transitions are pending → active, active → inactive, and pending → failed —
+// see docs/infrastructure-packages.md.
 type Status string
 
 const (
-	StatusPending  Status = "pending"
-	StatusActive   Status = "active"
-	StatusInactive Status = "inactive"
-	StatusFailed   Status = "failed"
+	StatusPending  Status = "pending"  // saved, not yet activated
+	StatusActive   Status = "active"   // what every replica reconciles against; at most one per collection
+	StatusInactive Status = "inactive" // superseded by a newer active snapshot
+	StatusFailed   Status = "failed"   // abandoned before activation, never applied
 )
 
 // Snapshot represents a stored config snapshot.
@@ -33,6 +35,10 @@ type Snapshot struct {
 
 // Storage defines the persistence interface for config snapshots,
 // apply logging, and leader election via advisory locks.
+//
+// Schema creation is deliberately absent: DDL is implementation-specific, so
+// Migrate lives on the concrete type (storage/postgres.Storage) and consumers
+// call it directly.
 type Storage interface {
 	// SaveSnapshot persists a new snapshot in pending state.
 	SaveSnapshot(ctx context.Context, collection, version string, content []byte) error

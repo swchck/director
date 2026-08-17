@@ -15,6 +15,7 @@ import (
 )
 
 // ViewStore implements config.ViewPersistence using an in-memory map.
+// Data is copied in and out, so a caller never shares a slice with the store.
 type ViewStore struct {
 	mu   sync.RWMutex
 	data map[string][]byte

@@ -25,14 +25,18 @@ import (
 // CollectionSource provides data for a multi-item collection.
 // Implement this interface to sync from any backend.
 type CollectionSource[T any] interface {
-	// List fetches all items from the source.
-	// Called by the manager on every sync cycle.
+	// List fetches all items from the source. Only the leader calls it, and only
+	// on a cycle that moves to a new version or is forced.
 	List(ctx context.Context) ([]T, error)
 
 	// LastModified returns the most recent modification timestamp.
 	// Used for lightweight change detection — if the timestamp hasn't changed
 	// since the last sync, the full List() call is skipped.
-	// Return time.Time{} (zero) if unknown — the manager will always do a full fetch.
+	//
+	// Return time.Time{} (zero) if unknown. Polling then cannot detect changes:
+	// the manager fetches once on first load and afterwards only when a sync is
+	// forced (e.g. a WebSocket event), because it never moves a collection onto a
+	// version older than the one it holds.
 	LastModified(ctx context.Context) (time.Time, error)
 }
 

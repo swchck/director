@@ -1,6 +1,7 @@
 // Package log defines the Logger interface used throughout the director library.
 //
-// The library does not depend on any specific logging implementation.
+// No library package imports a logging implementation: that choice belongs to the
+// consumer, and a library that picks one forces it into every dependency tree.
 // A built-in slog adapter is provided. For other loggers (zerolog, zap, etc.),
 // implement the Logger interface — it's 4 methods.
 // A no-op logger is used by default when no logger is configured.
@@ -23,16 +24,9 @@ package log
 //
 // Implementations must be safe for concurrent use.
 type Logger interface {
-	// Debug logs a message at debug level with optional key-value fields.
 	Debug(msg string, fields ...Field)
-
-	// Info logs a message at info level with optional key-value fields.
 	Info(msg string, fields ...Field)
-
-	// Warn logs a message at warn level with optional key-value fields.
 	Warn(msg string, fields ...Field)
-
-	// Error logs a message at error level with optional key-value fields.
 	Error(msg string, fields ...Field)
 }
 

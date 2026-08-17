@@ -19,8 +19,6 @@ import (
 	pgstorage "github.com/swchck/director/storage/postgres"
 )
 
-// Domain types for e2e tests
-
 type e2eArticle struct {
 	ID       int    `json:"id"`
 	Name     string `json:"name"`
@@ -34,20 +32,16 @@ type e2eAppConfig struct {
 	Debug    bool `json:"debug"`
 }
 
-// Full sync test: manager syncs from Directus, Views recompute, queries work
-
 func TestE2E_ManagerSyncsCollectionAndSingleton(t *testing.T) {
 	dc := testDirectusClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Cleanup.
 	t.Cleanup(func() {
 		cleanupCollection(t, dc, "e2e_articles")
 		cleanupCollection(t, dc, "e2e_app_config")
 	})
 
-	// --- Create schema ---
 	err := dc.CreateCollection(ctx, directus.CreateCollectionInput{
 		Collection: "e2e_articles",
 		Fields: []directus.FieldInput{
@@ -83,7 +77,6 @@ func TestE2E_ManagerSyncsCollectionAndSingleton(t *testing.T) {
 		t.Fatalf("create app config: %v", err)
 	}
 
-	// --- Seed data ---
 	type articleCreate struct {
 		Name     string `json:"name"`
 		Category string `json:"category"`
@@ -108,7 +101,6 @@ func TestE2E_ManagerSyncsCollectionAndSingleton(t *testing.T) {
 		t.Fatalf("create article 3: %v", err)
 	}
 
-	// --- Set up infrastructure ---
 	pgPool := testPgPool(t)
 	rdb := testRedisClient(t)
 
@@ -126,11 +118,9 @@ func TestE2E_ManagerSyncsCollectionAndSingleton(t *testing.T) {
 
 	redisCache := rediscache.NewCache(rdb, rediscache.WithTTL(5*time.Minute))
 
-	// --- Define configs ---
 	articles := dcfg.NewCollection[e2eArticle]("e2e_articles")
 	appConfig := dcfg.NewSingleton[e2eAppConfig]("e2e_app_config")
 
-	// --- Create views ---
 	techView := dcfg.NewView("e2e-tech", articles,
 		[]dcfg.FilterOption[e2eArticle]{
 			dcfg.Where(func(a e2eArticle) bool { return a.Category == "tech" }),
@@ -138,7 +128,6 @@ func TestE2E_ManagerSyncsCollectionAndSingleton(t *testing.T) {
 		},
 	)
 
-	// --- Set up manager ---
 	configSingleton := directus.NewSingleton[e2eAppConfig](dc, "e2e_app_config")
 
 	mgr := manager.New(store, notif, reg,
@@ -154,7 +143,6 @@ func TestE2E_ManagerSyncsCollectionAndSingleton(t *testing.T) {
 	manager.RegisterCollection(mgr, articles, articleItems)
 	manager.RegisterSingleton(mgr, appConfig, configSingleton)
 
-	// --- Start manager ---
 	mgrCtx, mgrCancel := context.WithCancel(ctx)
 	defer mgrCancel()
 
@@ -164,7 +152,6 @@ func TestE2E_ManagerSyncsCollectionAndSingleton(t *testing.T) {
 	// Wait for initial sync.
 	time.Sleep(3 * time.Second)
 
-	// --- Assert: Collection synced ---
 	t.Run("collection_synced", func(t *testing.T) {
 		if articles.Count() != 3 {
 			t.Errorf("articles.Count() = %d, want 3", articles.Count())
@@ -180,7 +167,6 @@ func TestE2E_ManagerSyncsCollectionAndSingleton(t *testing.T) {
 		}
 	})
 
-	// --- Assert: Singleton synced ---
 	t.Run("singleton_synced", func(t *testing.T) {
 		cfg, ok := appConfig.Get()
 		if !ok {
@@ -192,7 +178,6 @@ func TestE2E_ManagerSyncsCollectionAndSingleton(t *testing.T) {
 		}
 	})
 
-	// --- Assert: View computed ---
 	t.Run("view_computed", func(t *testing.T) {
 		if techView.Count() != 2 {
 			t.Errorf("tech view count = %d, want 2", techView.Count())
@@ -209,21 +194,18 @@ func TestE2E_ManagerSyncsCollectionAndSingleton(t *testing.T) {
 		}
 	})
 
-	// --- Assert: Version is set ---
 	t.Run("version_set", func(t *testing.T) {
 		if articles.Version().IsZero() {
 			t.Error("articles version is zero")
 		}
 	})
 
-	// --- Mutate data in Directus and force re-sync ---
 	t.Run("resync_after_mutation", func(t *testing.T) {
-		// Note: Directus date_updated version detection depends on the special
-		// metadata being applied. If it's not (Directus 11 quirk with API-created
-		// collections), the version won't change and SyncNow will be a no-op.
-		// This test verifies the resync path by directly listing from Directus
-		// and confirming the new item exists, then verifying the manager can
-		// re-sync when the version is explicitly different.
+		// Only asserts that the mutation landed in Directus, not that the manager
+		// picked it up: version detection needs date_updated special metadata,
+		// which Directus 11 does not reliably apply to API-created collections,
+		// so a sync here can legitimately be a no-op. WS-triggered resync is
+		// covered in websocket_test.go.
 
 		_, err := articleCreateItems.Create(ctx, &articleCreate{Name: "Python Basics", Category: "tech", Level: 30})
 		if err != nil {
@@ -253,7 +235,6 @@ func TestE2E_ManagerSyncsCollectionAndSingleton(t *testing.T) {
 		}
 	})
 
-	// --- Assert: Filter pipeline works on real data ---
 	t.Run("filter_pipeline", func(t *testing.T) {
 		result := articles.Filter(
 			dcfg.Where(func(a e2eArticle) bool { return a.Category == "tech" }),
@@ -271,12 +252,9 @@ func TestE2E_ManagerSyncsCollectionAndSingleton(t *testing.T) {
 		}
 	})
 
-	// Stop.
 	mgrCancel()
 	<-errCh
 }
-
-// Cache test: data persists in Redis across manager restarts
 
 func TestE2E_CacheWarmStart(t *testing.T) {
 	dc := testDirectusClient(t)
@@ -285,7 +263,6 @@ func TestE2E_CacheWarmStart(t *testing.T) {
 
 	t.Cleanup(func() { cleanupCollection(t, dc, "e2e_cache_items") })
 
-	// Create collection.
 	err := dc.CreateCollection(ctx, directus.CreateCollectionInput{
 		Collection: "e2e_cache_items",
 		Fields: []directus.FieldInput{
@@ -382,8 +359,6 @@ func TestE2E_CacheWarmStart(t *testing.T) {
 	mgr2Cancel()
 }
 
-// Items CRUD test: full lifecycle with Directus API
-
 func TestE2E_ItemsCRUDLifecycle(t *testing.T) {
 	dc := testDirectusClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -421,13 +396,11 @@ func TestE2E_ItemsCRUDLifecycle(t *testing.T) {
 	items := directus.NewItems[CrudItem](dc, "e2e_crud")
 	createItems := directus.NewItems[CrudCreate](dc, "e2e_crud")
 
-	// Create.
 	_, err = createItems.Create(ctx, &CrudCreate{Name: "alpha", Score: 10})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
-	// List to verify creation.
 	allItems, err := items.List(ctx)
 	if err != nil {
 		t.Fatalf("list after create: %v", err)
@@ -439,7 +412,6 @@ func TestE2E_ItemsCRUDLifecycle(t *testing.T) {
 
 	firstID := fmt.Sprintf("%d", allItems[0].ID)
 
-	// Update.
 	updated, err := items.Update(ctx, firstID, &CrudItem{Name: "alpha-updated", Score: 99})
 	if err != nil {
 		t.Fatalf("update: %v", err)
@@ -449,7 +421,6 @@ func TestE2E_ItemsCRUDLifecycle(t *testing.T) {
 		t.Errorf("update result: %+v", updated)
 	}
 
-	// Create more items.
 	_, _ = createItems.Create(ctx, &CrudCreate{Name: "beta", Score: 50})
 	_, _ = createItems.Create(ctx, &CrudCreate{Name: "gamma", Score: 30})
 
@@ -476,7 +447,6 @@ func TestE2E_ItemsCRUDLifecycle(t *testing.T) {
 		t.Fatalf("max date: %v", err)
 	}
 
-	// Delete.
 	if err := items.Delete(ctx, firstID); err != nil {
 		t.Fatalf("delete: %v", err)
 	}

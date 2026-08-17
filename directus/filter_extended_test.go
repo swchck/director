@@ -132,9 +132,8 @@ func TestWithDeep_MultipleRelations(t *testing.T) {
 	var deepMap map[string]any
 	json.Unmarshal([]byte(deep), &deepMap)
 
-	// Note: WithDeep replaces per-relation, so only "comments" will be in the deep map
-	// because both calls are on queryParams which uses a map.
-	// Actually, we call WithDeep twice on different relations, so both should be there.
+	// WithDeep keys by relation, so calls for different relations accumulate
+	// rather than replace.
 	if _, ok := deepMap["comments"]; !ok {
 		t.Error("expected comments in deep")
 	}

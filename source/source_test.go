@@ -22,8 +22,6 @@ type settings struct {
 	Locale   string `json:"locale"`
 }
 
-// FromDirectus (CollectionSource adapter)
-
 func TestFromDirectus_List(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 
@@ -43,7 +41,7 @@ func TestFromDirectus_List(t *testing.T) {
 	items := directus.NewItems[product](dc, "products")
 	src := source.FromDirectus(items)
 
-	_ = now // used only to ensure the test setup is valid
+	_ = now
 
 	ctx := context.Background()
 	result, err := src.List(ctx)
@@ -70,7 +68,7 @@ func TestFromDirectus_LastModified(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		// The Items.MaxDateUpdated calls with sort=-date_updated&limit=1
+		// Items.MaxDateUpdated queries sort=-date_updated&limit=1.
 		if r.URL.Query().Get("limit") == "1" && r.URL.Query().Get("sort") == "-date_updated" {
 			json.NewEncoder(w).Encode(map[string]any{
 				"data": []map[string]any{
@@ -155,8 +153,6 @@ func TestFromDirectus_ImplementsCollectionSource(t *testing.T) {
 	items := directus.NewItems[product](dc, "products")
 	var _ = source.FromDirectus(items)
 }
-
-// FromDirectusSingleton (SingletonSource adapter)
 
 func TestFromDirectusSingleton_Get(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

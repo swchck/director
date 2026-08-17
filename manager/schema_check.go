@@ -7,24 +7,16 @@ import (
 	dlog "github.com/swchck/director/log"
 )
 
-// schemaCheckEntry is captured at registration time so the manager can
-// later compare a Go struct against the live Directus schema. Generic-source
-// registrations (RegisterCollectionSource / RegisterSingletonSource) do not
-// produce entries — schema check only applies to Directus-backed configs.
+// schemaCheckEntry is captured at registration time so the manager can compare a Go
+// struct against the live Directus schema. Only Directus registrations make one.
 type schemaCheckEntry struct {
 	collection string
 	client     *directus.Client
 	sample     any
 }
 
-// runSchemaChecks iterates captured Directus-backed registrations, fetches
-// their live schemas, and logs warnings for any Go-declared field that is
-// absent in Directus. Off-by-default (gated by WithSchemaCheck); intended as
-// a startup smoke test for catching renamed/deleted fields before they cause
-// silent data loss.
-//
-// Failures fetching a schema are logged and skipped — schema check should
-// never block startup.
+// runSchemaChecks warns about Go-declared fields the live Directus schema lacks. See
+// WithSchemaCheck; an unfetchable schema is skipped, never fatal.
 func (m *Manager) runSchemaChecks(ctx context.Context) {
 	if !m.schemaCheck {
 		return

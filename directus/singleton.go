@@ -7,11 +7,8 @@ import (
 	"time"
 )
 
-// Singleton provides typed read/update operations for a Directus singleton collection.
-// Singleton collections return a single object (not an array) from the items endpoint.
-//
-// Supports relational fields: use WithFields with dot notation (e.g. "translations.*")
-// and WithDeep for filtering nested relations.
+// Singleton provides typed read/update operations for a Directus singleton collection,
+// whose items endpoint returns one object rather than an array — hence not Items.
 type Singleton[T any] struct {
 	client     *Client
 	collection string
@@ -30,15 +27,12 @@ func (s *Singleton[T]) Collection() string {
 	return s.collection
 }
 
-// Client returns the underlying Directus client. Useful when a caller already
-// holds a Singleton wrapper and needs ad-hoc REST calls (e.g. ListFields for
-// schema introspection) without re-threading the client.
+// Client returns the underlying Directus client for ad-hoc REST calls.
 func (s *Singleton[T]) Client() *Client {
 	return s.client
 }
 
-// Get fetches the singleton item.
-// Use WithFields with dot notation to include relational data (e.g. "translations.*").
+// Get fetches the singleton item, shaped by the given QueryOptions.
 func (s *Singleton[T]) Get(ctx context.Context, opts ...QueryOption) (*T, error) {
 	query, err := buildQuery(opts)
 	if err != nil {
@@ -73,22 +67,18 @@ func (s *Singleton[T]) Update(ctx context.Context, item *T) (*T, error) {
 	return &updated, nil
 }
 
-// DateUpdated fetches the date_updated value from the singleton.
-// DateUpdated fetches the modification timestamp from the singleton.
-// Tries date_updated first, falls back to date_created.
-// Used for version detection.
+// DateUpdated returns the singleton's date_updated, else date_created, else the
+// zero time. Same version-signal semantics as Items.MaxDateUpdated.
 func (s *Singleton[T]) DateUpdated(ctx context.Context) (time.Time, error) {
-	// Try date_updated first.
 	t, err := s.fetchTimestamp(ctx, "date_updated")
 	if err == nil && !t.IsZero() {
 		return t, nil
 	}
-	// Field might not exist (403/400) or have no value — fall through.
 
-	// Fallback: date_created.
+	// date_updated may be absent from the schema (400/403) or unset.
 	t, err = s.fetchTimestamp(ctx, "date_created")
 	if err != nil {
-		// Field might not exist either — not fatal.
+		// Neither field exists — a singleton without timestamps is not an error.
 		return time.Time{}, nil
 	}
 

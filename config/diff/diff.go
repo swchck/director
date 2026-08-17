@@ -1,48 +1,19 @@
-// Package diff classifies items between two slices into added, updated, and
-// removed buckets keyed by a user-supplied function.
-//
-// Typical use is inside an OnChange hook: the consumer receives (old, new)
-// slices on every Swap and wants to react only to the items that actually
-// changed — emit a Kafka event for new rows, invalidate an external cache
-// entry for updated rows, and so on.
-//
-// Example:
-//
-//	products.OnChange(func(old, new []Product) {
-//	    added, updated, removed := diff.By(old, new, func(p Product) int { return p.ID })
-//	    for _, p := range added   { publish("product.created", p) }
-//	    for _, p := range updated { publish("product.updated", p) }
-//	    for _, p := range removed { publish("product.deleted", p) }
-//	})
-//
-// Items are matched by key. If multiple items share a key the result is
-// unspecified — keys must be unique within each slice.
+// Package diff sorts items between two slices into added, updated and removed buckets by a
+// user-supplied key — typically inside a config OnChange hook. See docs/config-package.md.
 package diff
 
 import "reflect"
 
-// By categorizes items between oldSlice and newSlice using keyFn for identity.
-//
-//   - added contains items whose key is present in newSlice but not in oldSlice
-//   - updated contains items from newSlice whose key is present in both slices
-//     but whose value differs (compared with reflect.DeepEqual)
-//   - removed contains items whose key is present in oldSlice but not in newSlice
-//
-// Updated items are returned with their new values. To compare with the
-// previous value, look up the key in oldSlice.
-//
-// Order within each result slice is unspecified. For custom equality (e.g.
-// to compare only specific fields, or to skip reflect for performance), use
-// ByEqual.
+// By categorizes items by keyFn identity: added and removed for keys on one side only, updated
+// (new value) for keys on both differing under reflect.DeepEqual. Keys must be unique per slice.
 func By[T any, K comparable](oldSlice, newSlice []T, keyFn func(T) K) (added, updated, removed []T) {
 	return ByEqual(oldSlice, newSlice, keyFn, func(a, b T) bool {
 		return reflect.DeepEqual(a, b)
 	})
 }
 
-// ByEqual is like By but uses equal as the per-item equality predicate.
-// equal is called for keys that exist in both slices; it receives (oldItem,
-// newItem) and returns true if the item is considered unchanged.
+// ByEqual is like By but calls equal(oldItem, newItem) for keys present in both slices,
+// treating a true result as unchanged.
 func ByEqual[T any, K comparable](oldSlice, newSlice []T, keyFn func(T) K, equal func(a, b T) bool) (added, updated, removed []T) {
 	oldByKey := make(map[K]T, len(oldSlice))
 	for _, item := range oldSlice {

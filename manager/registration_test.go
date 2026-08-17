@@ -371,7 +371,6 @@ func TestManager_SourceListError_DoesNotCrash(t *testing.T) {
 
 	time.Sleep(500 * time.Millisecond)
 
-	// Should still be empty since the source errored.
 	if products.Count() != 0 {
 		t.Errorf("Count() = %d, want 0 after source error", products.Count())
 	}
@@ -408,7 +407,6 @@ func TestManager_SourceVersionError_DoesNotCrash(t *testing.T) {
 
 	time.Sleep(500 * time.Millisecond)
 
-	// Should be empty since version check errored.
 	if products.Count() != 0 {
 		t.Errorf("Count() = %d, want 0 after version error", products.Count())
 	}

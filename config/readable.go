@@ -1,13 +1,7 @@
 package config
 
-// ReadableCollection is a read-only view of a Collection.
-// Use this as the exported type in config units to prevent
-// consumers from calling Swap() directly.
-//
-//	type Products struct {
-//	    col *config.Collection[Product]          // unexported: has Swap()
-//	    All config.ReadableCollection[Product]   // exported: read-only
-//	}
+// ReadableCollection is the read-only surface of a Collection. Export this from a config unit,
+// keeping the Collection unexported, so only the manager reaches Swap.
 type ReadableCollection[T any] interface {
 	Name() string
 	Version() Version
@@ -26,7 +20,6 @@ type ReadableSingleton[T any] interface {
 	Get() (T, bool)
 }
 
-// Compile-time interface compliance checks.
 var _ ReadableCollection[int] = (*Collection[int])(nil)
 var _ ReadableCollection[int] = (*View[int])(nil)
 var _ ReadableCollection[int] = (*RelatedView[int, int])(nil)

@@ -11,46 +11,30 @@ import (
 
 const defaultPersistenceTimeout = 10 * time.Second
 
-// defaultPersistenceMaxConcurrency is the maximum number of concurrent
-// persistence goroutines per view. When the limit is reached, newer saves
-// are dropped — the next Swap will produce a fresh save anyway.
+// defaultPersistenceMaxConcurrency caps concurrent persistence goroutines per view; past
+// the limit a save is silently skipped, since the next Swap produces a fresh one anyway.
 const defaultPersistenceMaxConcurrency = 2
 
-// ViewPersistence allows View results to be stored externally (e.g. Redis).
-// This enables sharing precomputed views across replicas without recomputation.
-//
-// Implementations are provided in the cache package (e.g. RedisViewStore).
+// ViewPersistence stores computed view results externally (e.g. Redis) for warm starts;
+// implemented by cache/redis.ViewStore and cache/memory.ViewStore. See keepWarmStart.
 type ViewPersistence interface {
 	Save(ctx context.Context, key string, data []byte) error
 	Load(ctx context.Context, key string) ([]byte, error)
 }
 
-// viewSnapshot holds a precomputed, immutable view result.
+// keepWarmStart reports whether a stored snapshot stands instead of the initial compute:
+// only while the source is unloaded, since after that the view must be a function of it.
+func keepWarmStart(loaded bool, sourceVersion Version) bool {
+	return loaded && sourceVersion.IsZero()
+}
+
 type viewSnapshot[T any] struct {
 	items   []T
 	version Version
 }
 
-// View is an auto-updating materialized view over a Collection[T].
-//
-// Define filter, sort, and limit rules once — the View automatically recomputes
-// when the source collection changes. Results are cached in memory (lock-free reads)
-// and optionally persisted to an external store like Redis.
-//
-// Example — keep a sorted, filtered cache of tech articles:
-//
-//	techView := config.NewView("tech-by-level", articles,
-//	    []config.FilterOption[Article]{
-//	        config.Where(func(a Article) bool { return a.Category == "tech" }),
-//	        config.SortBy(func(a, b Article) int { return cmp.Compare(a.Level, b.Level) }),
-//	        config.Limit[Article](100),
-//	    },
-//	)
-//
-// The view can be further queried without copying the full collection:
-//
-//	top := techView.Filter(config.Limit[Article](10))
-//	item, ok := techView.Find(func(a Article) bool { return a.ID == 42 })
+// View is an auto-updating materialized projection of a Collection[T]: filter, sort and
+// limit rules applied once per source Swap, cached in memory for lock-free reads.
 type View[T any] struct {
 	name               string
 	source             *Collection[T]
@@ -71,20 +55,16 @@ type View[T any] struct {
 // ViewOption configures optional View behavior.
 type ViewOption[T any] func(*View[T])
 
-// WithPersistence enables external persistence for the view.
-// When set, the view saves its computed results after each recomputation
-// and loads from the store on creation for a warm start.
+// WithPersistence enables external persistence for the view: computed results are
+// saved after each recomputation, and a stored one warms the view on creation.
 func WithPersistence[T any](p ViewPersistence) ViewOption[T] {
 	return func(v *View[T]) {
 		v.persistence = p
 	}
 }
 
-// NewView creates an auto-updating view over a source Collection.
-//
-// name is used as the persistence key and for logging.
-// filters define the transformation pipeline (Where, SortBy, Limit, Offset).
-// The view immediately computes its initial state from the current collection data.
+// NewView creates an auto-updating view; name doubles as the persistence key, filters are
+// the pipeline. It computes at once, unless persistence warmed it while source is unloaded.
 func NewView[T any](name string, source *Collection[T], filters []FilterOption[T], opts ...ViewOption[T]) *View[T] {
 	v := &View[T]{
 		name:    name,
@@ -96,23 +76,16 @@ func NewView[T any](name string, source *Collection[T], filters []FilterOption[T
 		opt(v)
 	}
 
-	// Initialize semaphore for bounded persistence concurrency.
 	if v.persistence != nil {
 		v.persistSem = make(chan struct{}, defaultPersistenceMaxConcurrency)
 	}
 
-	// Initialize with empty snapshot.
 	v.data.Store(&viewSnapshot[T]{})
 
-	// Try loading from persistence first.
-	if v.persistence != nil {
-		v.loadFromPersistence()
+	if !keepWarmStart(v.loadFromPersistence(), source.Version()) {
+		v.recompute(source.All(), source.Version())
 	}
 
-	// Compute initial view from current source data.
-	v.recompute(source.All(), source.Version())
-
-	// Register for future updates.
 	v.unsub = source.OnChange(func(_, newItems []T) {
 		v.recompute(newItems, source.Version())
 	})
@@ -130,10 +103,7 @@ func (v *View[T]) Version() Version {
 	return v.data.Load().version
 }
 
-// Close unsubscribes the view from its source collection. After Close,
-// the view stops recomputing on source changes. It is safe to call
-// Close multiple times. Reads remain valid after Close but return
-// stale data.
+// Close unsubscribes the view from its source; idempotent. Reads stay valid but go stale.
 func (v *View[T]) Close() {
 	v.closeOnce.Do(func() {
 		if v.unsub != nil {
@@ -168,8 +138,6 @@ func (v *View[T]) First() (T, bool) {
 }
 
 // Find returns the first item in the view matching the predicate.
-//
-// The predicate must not panic. If it does, the panic propagates to the caller.
 func (v *View[T]) Find(pred func(T) bool) (T, bool) {
 	for _, item := range v.data.Load().items {
 		if pred(item) {
@@ -182,8 +150,6 @@ func (v *View[T]) Find(pred func(T) bool) (T, bool) {
 }
 
 // FindMany returns all items in the view matching the predicate.
-//
-// The predicate must not panic. If it does, the panic propagates to the caller.
 func (v *View[T]) FindMany(pred func(T) bool) []T {
 	var result []T
 	for _, item := range v.data.Load().items {
@@ -200,8 +166,7 @@ func (v *View[T]) Filter(opts ...FilterOption[T]) []T {
 	return applyFilters(v.data.Load().items, opts)
 }
 
-// OnChange registers a callback that fires after the view recomputes.
-// Returns a function that removes the hook when called.
+// OnChange registers a callback fired after each recompute; the unregister is idempotent.
 func (v *View[T]) OnChange(fn func(old, new []T)) func() {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -223,12 +188,12 @@ func (v *View[T]) OnChange(fn func(old, new []T)) func() {
 func (v *View[T]) recompute(sourceItems []T, version Version) {
 	var stored []T
 	if len(v.filters) > 0 {
-		// applyFilters returns a new slice; copy it to own the data.
+		// Re-copy to trim: filters hand back subslices or source-sized slices, either of
+		// which would pin a source-sized backing array for the life of the snapshot.
 		items := applyFilters(sourceItems, v.filters)
 		stored = make([]T, len(items))
 		copy(stored, items)
 	} else {
-		// No filters — skip applyFilters, just copy source directly.
 		stored = make([]T, len(sourceItems))
 		copy(stored, sourceItems)
 	}
@@ -238,9 +203,7 @@ func (v *View[T]) recompute(sourceItems []T, version Version) {
 		version: version,
 	})
 
-	// Persist asynchronously to avoid blocking the OnChange callback chain.
-	// Uses a semaphore to bound concurrency — if max goroutines are in flight,
-	// this save is skipped (the next Swap will produce a fresher save).
+	// Async so a slow store never delays the swap chain.
 	if v.persistence != nil {
 		select {
 		case v.persistSem <- struct{}{}:
@@ -253,12 +216,11 @@ func (v *View[T]) recompute(sourceItems []T, version Version) {
 		}
 	}
 
-	// Fire view hooks with panic recovery.
 	v.mu.RLock()
 	hooks := v.hooks
 	v.mu.RUnlock()
 
-	// Defensive copies so hooks cannot mutate the internal snapshots.
+	// Copies, shared between hooks: they isolate the published snapshot, not each other.
 	oldCopy := make([]T, len(old.items))
 	copy(oldCopy, old.items)
 	newCopy := make([]T, len(stored))
@@ -309,33 +271,33 @@ func (v *View[T]) saveToPersistence(items []T) {
 	}
 }
 
-func (v *View[T]) loadFromPersistence() {
+// loadFromPersistence installs a stored snapshot and reports whether it did. A read that
+// fails, is absent, or decodes to null is not an error: the view computes instead.
+func (v *View[T]) loadFromPersistence() bool {
+	if v.persistence == nil {
+		return false
+	}
+
 	ctx, cancel := v.persistCtx()
 	defer cancel()
 
 	data, err := v.persistence.Load(ctx, v.name)
 	if err != nil || len(data) == 0 {
-		return
+		return false
 	}
 
 	var items []T
-	if err := json.Unmarshal(data, &items); err != nil {
-		return
+	if err := json.Unmarshal(data, &items); err != nil || items == nil {
+		return false
 	}
 
 	v.data.Store(&viewSnapshot[T]{items: items})
+
+	return true
 }
 
-// SingletonView is an auto-updating materialized transformation of a Singleton[T].
-//
-// It allows applying a transformation function to the singleton value and caching
-// the result. Useful when the raw singleton needs post-processing before use.
-//
-// Example — extract and cache a specific field from a settings singleton:
-//
-//	featureFlags := config.NewSingletonView("features", settings,
-//	    func(s Settings) FeatureFlags { return s.Features },
-//	)
+// SingletonView is an auto-updating materialized transformation of a Singleton[T], cached
+// for lock-free reads. Useful when the raw singleton needs post-processing before use.
 type SingletonView[T any, R any] struct {
 	name               string
 	source             *Singleton[T]
@@ -380,10 +342,8 @@ func WithSingletonViewPersistenceTimeout[T any, R any](d time.Duration) Singleto
 	}
 }
 
-// NewSingletonView creates a transformed view of a Singleton.
-//
-// transform is called each time the source singleton changes, and the result
-// is cached for lock-free reads.
+// NewSingletonView creates a transformed view of a Singleton; transform runs on every
+// source change and its result is cached.
 func NewSingletonView[T any, R any](name string, source *Singleton[T], transform func(T) R, opts ...SingletonViewOption[T, R]) *SingletonView[T, R] {
 	v := &SingletonView[T, R]{
 		name:      name,
@@ -401,17 +361,13 @@ func NewSingletonView[T any, R any](name string, source *Singleton[T], transform
 
 	v.data.Store(&singletonViewSnapshot[R]{})
 
-	// Load from persistence.
-	if v.persistence != nil {
-		v.loadFromPersistence()
-	}
+	v.loadFromPersistence()
 
-	// Compute initial value.
+	// keepWarmStart's rule via the source's own flag: nothing to transform while unloaded.
 	if val, ok := source.Get(); ok {
 		v.recompute(val, source.Version())
 	}
 
-	// Register for updates.
 	v.unsub = source.OnChange(func(_, newVal *T) {
 		if newVal != nil {
 			v.recompute(*newVal, source.Version())
@@ -437,9 +393,7 @@ func (v *SingletonView[T, R]) Name() string {
 	return v.name
 }
 
-// Close unsubscribes the view from its source singleton. After Close,
-// the view stops recomputing on source changes. It is safe to call
-// Close multiple times.
+// Close unsubscribes the view from its source; idempotent. Reads stay valid but go stale.
 func (v *SingletonView[T, R]) Close() {
 	v.closeOnce.Do(func() {
 		if v.unsub != nil {
@@ -497,6 +451,10 @@ func (v *SingletonView[T, R]) saveToPersistence(result R) {
 }
 
 func (v *SingletonView[T, R]) loadFromPersistence() {
+	if v.persistence == nil {
+		return
+	}
+
 	ctx, cancel := v.persistCtx()
 	defer cancel()
 
@@ -513,28 +471,16 @@ func (v *SingletonView[T, R]) loadFromPersistence() {
 	v.data.Store(&singletonViewSnapshot[R]{value: &result})
 }
 
-// CompositeView combines multiple Views into a single read endpoint.
-// Useful when you need to merge results from views on the same collection
-// with different rules.
-//
-// Example:
-//
-//	combo := config.NewCompositeView("all-specials", foodView, drinkView)
-//	allSpecials := combo.All() // items from both views, deduplicated by user function
+// CompositeView merges several View[T] into one read endpoint. Unlike its siblings it holds no
+// snapshot and subscribes to nothing — reads fan out, so there is no Version and no Close.
 type CompositeView[T any] struct {
 	name  string
 	views []*View[T]
-	dedup func(T, T) bool // returns true if items are the same (for dedup)
+	dedup func(T, T) bool // nil disables deduplication
 }
 
-// NewCompositeView creates a view that merges results from multiple source views.
-//
-// dedup is optional — if nil, no deduplication is performed and results are concatenated.
-// If provided, it should return true when two items represent the same entity.
-//
-// Note: when dedup is set, deduplication uses linear search per item, resulting
-// in O(n²) time complexity where n is the total number of items across all views.
-// For large datasets, consider pre-filtering at the View level to minimize overlap.
+// NewCompositeView merges results from multiple views; dedup reports same-entity, nil just
+// concatenates. Dedup is a linear scan per item — O(n²) in total items across all views.
 func NewCompositeView[T any](name string, dedup func(a, b T) bool, views ...*View[T]) *CompositeView[T] {
 	return &CompositeView[T]{
 		name:  name,
@@ -564,8 +510,8 @@ func (cv *CompositeView[T]) All() []T {
 	return result
 }
 
-// Count returns the total number of items across all source views.
-// When no dedup function is set, this avoids allocating the merged slice.
+// Count returns the total number of items across all source views. Without a dedup
+// function it sums lengths instead of building the merged slice.
 func (cv *CompositeView[T]) Count() int {
 	if cv.dedup != nil {
 		return len(cv.All())
@@ -594,12 +540,12 @@ func (cv *CompositeView[T]) Name() string {
 	return cv.name
 }
 
-// ErrorFunc is a callback for handling non-fatal errors in views.
-// Used by persistence operations that run in background goroutines.
+// ErrorFunc reports non-fatal view errors: persistence failures from a background
+// goroutine, recovered hook panics from the Swap goroutine. Must be concurrency-safe.
 type ErrorFunc func(viewName string, err error)
 
-// WithErrorHandler sets an error callback for persistence failures.
-// Without this, persistence errors are silently ignored.
+// WithErrorHandler sets the callback for this view's persistence failures and recovered
+// hook panics. Without it, both are silently dropped.
 func WithErrorHandler[T any](fn ErrorFunc) ViewOption[T] {
 	return func(v *View[T]) {
 		v.onError = fn

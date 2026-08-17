@@ -15,8 +15,8 @@ import (
 	"github.com/swchck/director/notify"
 )
 
-// validChannelName matches valid PostgreSQL identifiers used for LISTEN/NOTIFY.
-// The channel name is interpolated into SQL, so we must restrict it to safe characters.
+// validChannelName restricts the channel name to a PostgreSQL identifier.
+// LISTEN takes no query parameters, so the name has to be interpolated into SQL.
 var validChannelName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 const (
@@ -69,9 +69,9 @@ func WithHealthCheckInterval(d time.Duration) Option {
 
 // NewChannel creates a new PostgreSQL notification channel.
 //
-// The channel name (set via WithChannel) must be a valid PostgreSQL identifier:
-// start with a letter or underscore, followed by letters, digits, or underscores.
-// Invalid names cause a panic to prevent SQL injection in the LISTEN statement.
+// It panics if the name set via WithChannel is not a valid PostgreSQL identifier
+// (letter or underscore, then letters, digits, underscores) — a wiring mistake,
+// not a runtime condition.
 func NewChannel(pool *pgxpool.Pool, opts ...Option) *Channel {
 	c := &Channel{
 		pool:                pool,
@@ -166,9 +166,9 @@ func (c *Channel) listenLoop(ctx context.Context, ch chan<- notify.Event) {
 	}
 }
 
-// listen acquires a connection, issues LISTEN, and reads notifications until
-// an error occurs or the context is cancelled. It periodically pings the
-// connection to detect half-open TCP failures.
+// listen forwards notifications until the connection fails or ctx is cancelled.
+// A wait that times out is not a failure — it is the cue to ping for a half-open
+// connection.
 func (c *Channel) listen(ctx context.Context, ch chan<- notify.Event) error {
 	conn, err := c.pool.Acquire(ctx)
 	if err != nil {
@@ -211,11 +211,10 @@ func (c *Channel) listen(ctx context.Context, ch chan<- notify.Event) error {
 			continue
 		}
 
-		// Non-blocking send: drop the event if the buffer is full.
-		// This prevents the listen goroutine from blocking, which would
-		// stop health check pings and delay dead-connection detection.
-		// Notifications are idempotent — the manager reconciles state
-		// on the next poll cycle regardless.
+		// Drop rather than block on a full buffer: a blocked listen goroutine
+		// stops the health-check pings above, so a dead connection would go
+		// unnoticed. Events are safe to lose — the manager reconciles against
+		// the active snapshot on its next cycle.
 		select {
 		case ch <- event:
 		default:
@@ -245,8 +244,6 @@ func (c *Channel) Close() error {
 	return nil
 }
 
-// nextBackoff returns the next backoff duration, doubling each time up to
-// maxBackoff.
 func nextBackoff(current time.Duration) time.Duration {
 	if current < minBackoff {
 		return minBackoff

@@ -105,7 +105,7 @@ func TestWSClient_Subscribe_ReceivesEvent(t *testing.T) {
 	srv := wsTestServer(t, true)
 	defer srv.Close()
 
-	// Convert http:// to ws://
+	// NewWSClient does the ws:// scheme rewrite itself.
 	wsURL := strings.Replace(srv.URL, "http://", "http://", 1)
 
 	ws := directus.NewWSClient(wsURL, "test-token")

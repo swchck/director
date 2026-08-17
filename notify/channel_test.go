@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/swchck/director/notify"
+	"github.com/swchck/director/notify/notifytest"
 )
 
 // memoryChannel is a simple in-process implementation of notify.Channel.
@@ -177,6 +178,15 @@ func TestMemoryChannel_DoubleClose_Safe(t *testing.T) {
 
 func TestMemoryChannel_ImplementsChannel(t *testing.T) {
 	var _ notify.Channel = newMemoryChannel()
+}
+
+func TestMemoryChannel_Contract(t *testing.T) {
+	notifytest.RunContract(t, func(t *testing.T) (notify.Channel, notify.Channel) {
+		ch := newMemoryChannel()
+		t.Cleanup(func() { ch.Close() })
+
+		return ch, ch
+	})
 }
 
 func TestEvent_Fields(t *testing.T) {

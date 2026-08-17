@@ -17,21 +17,35 @@ import (
 	"github.com/swchck/director/notify"
 )
 
-// captureLogger counts Warn calls per message text — sufficient for asserting
-// dedup behavior (one warn per (collection, version)).
+// captureLogger counts log calls per formatted message — enough to assert dedup and to
+// observe that the event loop reached a specific decision.
 type captureLogger struct {
-	mu    sync.Mutex
-	warns []string // formatted message + collection/version hint
-	infos []string
+	mu     sync.Mutex
+	warns  []string // formatted message + collection/version hint
+	infos  []string
+	debugs []string
 }
 
-func (l *captureLogger) Debug(string, ...dlog.Field) {}
+func (l *captureLogger) Debug(msg string, fields ...dlog.Field) {
+	line := formatLogLine(msg, fields)
+	l.mu.Lock()
+	l.debugs = append(l.debugs, line)
+	l.mu.Unlock()
+}
 func (l *captureLogger) Info(msg string, _ ...dlog.Field) {
 	l.mu.Lock()
 	l.infos = append(l.infos, msg)
 	l.mu.Unlock()
 }
 func (l *captureLogger) Warn(msg string, fields ...dlog.Field) {
+	line := formatLogLine(msg, fields)
+	l.mu.Lock()
+	l.warns = append(l.warns, line)
+	l.mu.Unlock()
+}
+func (l *captureLogger) Error(string, ...dlog.Field) {}
+
+func formatLogLine(msg string, fields []dlog.Field) string {
 	var b strings.Builder
 	b.WriteString(msg)
 	for _, f := range fields {
@@ -44,18 +58,33 @@ func (l *captureLogger) Warn(msg string, fields ...dlog.Field) {
 			fmt.Fprintf(&b, "%v", f.Value)
 		}
 	}
-	l.mu.Lock()
-	l.warns = append(l.warns, b.String())
-	l.mu.Unlock()
+	return b.String()
 }
-func (l *captureLogger) Error(string, ...dlog.Field) {}
 
 func (l *captureLogger) warnCount(substr string) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return countMatches(l.warns, substr)
+}
+
+// startedCount reports how many times the manager logged that it finished its
+// startup sequence — the signal that the run loop is up.
+func (l *captureLogger) startedCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return countMatches(l.infos, "manager: started")
+}
+
+func (l *captureLogger) debugCount(substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return countMatches(l.debugs, substr)
+}
+
+func countMatches(lines []string, substr string) int {
 	n := 0
-	for _, w := range l.warns {
-		if substr == "" || strings.Contains(w, substr) {
+	for _, line := range lines {
+		if substr == "" || strings.Contains(line, substr) {
 			n++
 		}
 	}
@@ -93,9 +122,8 @@ func (s *validationSource) set(items []twoPCArticle, ts time.Time) {
 	s.mu.Unlock()
 }
 
-// TestValidator_RejectsAndStaysOnPreviousVersion: validator returns error →
-// in-memory config not swapped; first version that arrives is invalid so
-// collection stays empty (no last-known-good).
+// TestValidator_RejectsAndStaysOnPreviousVersion: nothing swaps, and since the first
+// version to arrive is invalid the collection stays empty (no last-known-good).
 func TestValidator_RejectsAndStaysOnPreviousVersion(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -133,7 +161,6 @@ func TestValidator_RejectsAndStaysOnPreviousVersion(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- mgr.Start(ctx) }()
 
-	// Give startup + initial sync time to attempt and fail.
 	waitFor(t, 2*time.Second, func() bool {
 		return logger.warnCount("config update rejected") >= 1
 	})
@@ -193,7 +220,6 @@ func TestValidator_DedupesLogPerVersion(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- mgr.Start(ctx) }()
 
-	// Wait for at least one rejection log.
 	waitFor(t, 2*time.Second, func() bool {
 		return logger.warnCount("config update rejected") >= 1
 	})
@@ -285,9 +311,8 @@ func TestValidator_ClearsAfterSuccess(t *testing.T) {
 	<-errCh
 }
 
-// TestValidator_2PCLeaderRejects: leader's own validator fails on a fresh
-// fetch in 2PC mode → no snapshot saved, no prepare event published, no
-// version advancement; round is silently skipped after one warn.
+// TestValidator_2PCLeaderRejects: the leader's own validator fails on a fresh fetch —
+// no snapshot, no prepare, no version advance; the round is skipped after one warn.
 func TestValidator_2PCLeaderRejects(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -342,7 +367,6 @@ func TestValidator_2PCLeaderRejects(t *testing.T) {
 		}
 	}
 
-	// Verify no snapshot was even saved to storage.
 	if _, err := store.GetSnapshot(ctx, "articles", config.NewVersion(now).String()); err == nil {
 		t.Error("snapshot saved despite leader-side validator rejection")
 	}
@@ -351,9 +375,8 @@ func TestValidator_2PCLeaderRejects(t *testing.T) {
 	<-errCh
 }
 
-// TestValidator_2PCLeaderAbortDeduped: a follower's prepare_failed causes the
-// leader to abort. Triggering subsequent syncs on the same version must
-// produce only ONE "2PC aborting round" warn (dedup).
+// TestValidator_2PCLeaderAbortDeduped: a follower's prepare_failed aborts the round,
+// and further syncs on the same version must produce only ONE abort warn.
 func TestValidator_2PCLeaderAbortDeduped(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -377,6 +400,14 @@ func TestValidator_2PCLeaderAbortDeduped(t *testing.T) {
 		lastModified: now,
 	}
 
+	// An active older snapshot makes this a running replica: dedup is per version,
+	// and a replica that has never loaded keeps reporting instead.
+	seeded := config.NewVersion(now.Add(-time.Hour)).String()
+	if err := store.SaveSnapshot(ctx, "articles", seeded, []byte(`[{"id":9,"name":"Seeded"}]`)); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	store.forceActive("articles", seeded)
+
 	logger := &captureLogger{}
 	articles := config.NewCollection[twoPCArticle]("articles")
 
@@ -396,19 +427,26 @@ func TestValidator_2PCLeaderAbortDeduped(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- mgr.Start(ctx) }()
 
-	// Wait for the first abort warn.
-	waitFor(t, 3*time.Second, func() bool {
-		return logger.warnCount("2PC aborting round") >= 1
+	abortsPublished := func() int {
+		n := 0
+		for _, ev := range notif.publishedEvents() {
+			if ev.Action == notify.ActionAbort {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Drive further rounds on the same version off an observable, not a sleep:
+	// SyncNow coalesces into the cycle already running.
+	waitFor(t, 4*time.Second, func() bool {
+		mgr.SyncNow(ctx)
+		return abortsPublished() >= 3
 	})
 
-	// Trigger more retries on the same version.
-	for range 4 {
-		// Each ResetApplyLog inside leaderSync2PC clears the prior apply log,
-		// but the publish handler logs prepare_failed again immediately.
-		mgr.SyncNow(ctx)
+	if got := abortsPublished(); got < 3 {
+		t.Fatalf("aborted rounds = %d, want at least 3 on the same version", got)
 	}
-	time.Sleep(300 * time.Millisecond)
-
 	if got := logger.warnCount("2PC aborting round"); got != 1 {
 		t.Errorf("2PC abort warn fired %d times for the same version, want 1", got)
 	}
@@ -417,10 +455,8 @@ func TestValidator_2PCLeaderAbortDeduped(t *testing.T) {
 	<-errCh
 }
 
-// TestValidator_DiscardsInvalidSnapshotOnStartup: storage has an active
-// snapshot from a previous run that no longer satisfies the validator (e.g.,
-// validator was tightened). Manager must NOT load it; it stays empty until
-// a successful sync.
+// TestValidator_DiscardsInvalidSnapshotOnStartup: an active snapshot a tightened
+// validator now rejects must not load; the config stays empty until a good sync.
 func TestValidator_DiscardsInvalidSnapshotOnStartup(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -25,17 +25,28 @@ const (
 //
 // RoundID is populated only for 2PC events (prepare/commit/abort) so that
 // followers can correlate commit/abort back to the matching prepare.
+//
+// InstanceID identifies the publisher so a subscriber can recognise the copy
+// of its own event that the transport echoes back. It is empty for events
+// published by operators or external tooling, which every replica processes.
 type Event struct {
 	Action     string `json:"action"`
 	Collection string `json:"collection"`
 	Version    string `json:"version"`
 	RoundID    string `json:"round_id,omitempty"`
+	InstanceID string `json:"instance_id,omitempty"`
 }
 
 // Channel is the cross-replica notification interface.
-// Implementations deliver events to all listening instances.
+//
+// Implementations MUST deliver a published event to every subscriber on the
+// channel, including a subscription held by the publisher itself — that is how
+// PostgreSQL LISTEN/NOTIFY and Redis Pub/Sub behave. De-duplicating
+// self-published events is the consumer's job (the manager filters on
+// Event.InstanceID), never the transport's. The notify/notifytest conformance
+// suite checks an implementation against this contract.
 type Channel interface {
-	// Publish sends an event to all subscribers.
+	// Publish sends an event to all subscribers, including the publisher's own.
 	Publish(ctx context.Context, event Event) error
 
 	// Subscribe returns a channel that receives events.

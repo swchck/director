@@ -55,8 +55,11 @@ func main() {
 	fmt.Printf("Cheap products: %d\n", cheapView.Count())
 	fmt.Printf("Categories: %v\n", byCategory.Keys())
 
-	// The MemoryViewStore now holds the precomputed results.
-	// If you create a NEW view with the same name and store, it loads from cache first.
+	// Persistence writes are async, so give the save a moment before reading it back.
+	time.Sleep(50 * time.Millisecond)
+
+	// The MemoryViewStore now holds the precomputed results. A NEW view with the same name
+	// and store warms from them, and keeps them while its own collection is unloaded.
 	cheapView2 := config.NewView("cheap", config.NewCollection[Product]("empty"),
 		[]config.FilterOption[Product]{},
 		config.WithPersistence[Product](memStore),

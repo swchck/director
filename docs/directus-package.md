@@ -90,6 +90,22 @@ for event := range events {
 }
 ```
 
+`SubscribeWith` takes the same subscriptions with per-collection queries, so event payloads can carry relational data:
+
+```go
+ws.SubscribeWith(ctx,
+    directus.WSSubscription{
+        Collection: "articles",
+        Query: &directus.SubscriptionQuery{
+            Fields: []string{"*", "translations.*", "owner.*"},
+        },
+    },
+    directus.WSSubscription{Collection: "app_config"},
+)
+```
+
+Directus does not put the collection name on the wire — events are tagged with the `uid` of the subscription that produced them, and the client maps that back to `ChangeEvent.Collection`. Keepalives are JSON `{"type":"ping"}` messages, not WebSocket ping frames, and the connection is dropped unless a JSON `{"type":"pong"}` comes back; `handlePing` answers them.
+
 ## Error Handling
 
 All Directus API errors are wrapped in `*ResponseError` which implements `Unwrap()`:
@@ -171,6 +187,19 @@ Directus 11 quirk: fields with `special` metadata (date-created, date-updated, u
 | `JSONField(name)` | JSON code editor |
 | `M2OField(name, related)` | Many-to-One dropdown |
 
+### Field UI Metadata
+
+`FieldMeta.Interface` and `FieldMeta.Display` must both be set or the field shows as "Database Only" in the Data Studio — the field presets above already set them. When writing a `FieldInput` by hand, pick from the Directus vocabulary:
+
+| `FieldMeta` key | Purpose | Common values |
+|---|---|---|
+| `Interface` | Editing widget | `input`, `input-multiline`, `input-code`, `boolean`, `datetime`, `tags`, `select-dropdown`, `select-dropdown-m2o`, `list-m2m`, `list-o2m` |
+| `Display` | Rendering in list views | `formatted-value`, `raw`, `labels`, `boolean`, `datetime`, `related-values` |
+| `Width` | Slot in the detail view | `half`, `half-left`, `half-right`, `full`, `fill` |
+| `Special` | Directus internal handling | `m2o`, `uuid`, `date-created`, `date-updated`, `cast-boolean`, `cast-json`, `cast-timestamp` |
+
+`Options` and `DisplayOptions` are passed through untouched to the interface and display components respectively (e.g. `{"language": "json"}` for `input-code`).
+
 ### Relations
 
 **Builder helpers:**
@@ -189,6 +218,92 @@ Directus 11 quirk: fields with `special` metadata (date-created, date-updated, u
 | `CreateRelation(ctx, input)` | POST | `/relations` |
 | `DeleteRelation(ctx, collection, field)` | DELETE | `/relations/{collection}/{field}` |
 | `GetRelations(ctx, collection)` | GET | `/relations` or `/relations/{collection}` |
+
+**M2O — each product belongs to one category:**
+
+```go
+// The FK field on the "many" side, plus the relation itself.
+dc.CreateField(ctx, "products", directus.M2OField("category_id", "categories"))
+dc.CreateRelation(ctx, directus.M2O("products", "category_id", "categories"))
+```
+
+**O2M — one category has many products.** `aliasField` is a virtual field on the "one" side (no database column); `foreignKey` must already exist on the "many" side:
+
+```go
+dc.CreateRelation(ctx, directus.O2M("categories", "products", "products", "category_id"))
+```
+
+**M2M — products have many tags, tags have many products.** `M2M` only builds the two `RelationInput`s; the junction collection and its FK fields must exist first:
+
+```go
+// 1. Create the junction collection.
+dc.CreateCollection(ctx, directus.CreateCollectionInput{
+    Collection: "products_tags",
+    Meta:       &directus.CollectionMeta{Hidden: true},
+    Fields: []directus.FieldInput{
+        directus.PrimaryKeyField("id"),
+        {Field: "products_id", Type: directus.FieldTypeInteger},
+        {Field: "tags_id", Type: directus.FieldTypeInteger},
+    },
+})
+
+// 2. Create both sides of the relation.
+source, target := directus.M2M(directus.M2MInput{
+    Collection:          "products",
+    Related:             "tags",
+    JunctionCollection:  "products_tags",
+    JunctionSourceField: "products_id",
+    JunctionTargetField: "tags_id",
+    AliasField:          "tags",
+})
+dc.CreateRelation(ctx, source)
+dc.CreateRelation(ctx, target)
+```
+
+**Translations** are a specialized M2M whose junction stores the language-specific content. The languages collection must exist before `CreateRelation`:
+
+```go
+// 1. Create the languages collection.
+dc.CreateCollection(ctx, directus.CreateCollectionInput{
+    Collection: "languages",
+    Fields: []directus.FieldInput{
+        {Field: "code", Type: directus.FieldTypeString, Schema: &directus.FieldSchema{IsPrimaryKey: true, IsNullable: new(bool)}},
+        {Field: "name", Type: directus.FieldTypeString},
+    },
+})
+
+// 2. Create the translations junction collection.
+dc.CreateCollection(ctx, directus.CreateCollectionInput{
+    Collection: "products_translations",
+    Meta:       &directus.CollectionMeta{Hidden: true},
+    Fields: []directus.FieldInput{
+        directus.PrimaryKeyField("id"),
+        {Field: "products_id", Type: directus.FieldTypeInteger},
+        {Field: "languages_code", Type: directus.FieldTypeString},
+        {Field: "name", Type: directus.FieldTypeString},
+        {Field: "description", Type: directus.FieldTypeText},
+    },
+})
+
+// 3. Create the relations. The alias field on the source is always "translations".
+source, lang := directus.Translations("products", "products_translations",
+    "products_id", "languages_code", "languages")
+dc.CreateRelation(ctx, source)
+dc.CreateRelation(ctx, lang)
+```
+
+### Schema Drift Detection (`schema_compare.go`)
+
+`ListFields(ctx, collection)` returns the field names and types Directus declares; `CompareStruct(fields, sample)` reflects a zero-value struct against them and reports every Go-declared field absent from Directus as a `SchemaDrift{Field, JSONTag, Reason}`.
+
+Only that direction is reported — fields present in Directus but not in Go are ignored, since they are usually intentional (admin-only fields, system metadata).
+
+Comparison rules:
+
+- Unexported fields are skipped.
+- Fields with no `json` tag, or the tag `-`, are skipped — there is no contract to compare.
+- Embedded structs are flattened via `reflect.VisibleFields`, so promoted fields are compared individually alongside the embedded field itself.
+- A struct value or a pointer to one is accepted; anything else returns `nil`.
 
 ### File Folders (`folders.go`)
 

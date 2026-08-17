@@ -23,9 +23,8 @@ type schemaTestArticle struct {
 	Category string `json:"category"`
 }
 
-// captureLogger is defined in validation_test.go and reused here. Its Warn
-// captures msg + every key=value pair, so warnCount matches on field values
-// as well as the message text.
+// captureLogger (validation_test.go) records msg plus every key=value pair, so
+// warnCount below can match on field values such as a drifted field name.
 
 func TestSchemaCheck_DisabledByDefault_NoFieldsRequest(t *testing.T) {
 	hits := 0

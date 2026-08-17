@@ -92,7 +92,6 @@ func TestCollection_All_ReturnsCopy(t *testing.T) {
 func TestCollection_First(t *testing.T) {
 	c := config.NewCollection[item]("items")
 
-	// Empty.
 	_, ok := c.First()
 	if ok {
 		t.Error("First() should return false on empty collection")
@@ -222,7 +221,6 @@ func TestCollection_ConcurrentReadsDuringSwap(t *testing.T) {
 
 // TestCollection_OnChange_Unsubscribe verifies the function returned by
 // OnChange removes the hook so it stops firing on subsequent Swap calls.
-// Documented in CHANGELOG: "OnChange on all types now returns an unsubscribe function".
 func TestCollection_OnChange_Unsubscribe(t *testing.T) {
 	c := config.NewCollection[item]("things")
 

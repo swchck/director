@@ -16,7 +16,6 @@ func TestOptions_Defaults_PollInterval(t *testing.T) {
 		ServiceName: "test",
 	})
 
-	// Manager should have been created without panic.
 	if mgr == nil {
 		t.Fatal("New returned nil")
 	}
@@ -60,7 +59,6 @@ func TestOptions_WithLogger(t *testing.T) {
 	notif := newMockNotifier()
 	reg := newMockRegistry()
 
-	// Should not panic with a custom logger.
 	mgr := manager.New(store, notif, reg, manager.Options{ServiceName: "test"},
 		manager.WithLogger(nil), // nil logger should be handled gracefully at use-time
 	)
@@ -75,7 +73,6 @@ func TestOptions_CustomPollInterval(t *testing.T) {
 	notif := newMockNotifier()
 	reg := newMockRegistry()
 
-	// Custom options should not cause construction to fail.
 	mgr := manager.New(store, notif, reg, manager.Options{
 		PollInterval:             30 * time.Second,
 		HeartbeatInterval:        5 * time.Second,

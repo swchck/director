@@ -134,9 +134,8 @@ func TestStatus_AfterSuccessfulSync(t *testing.T) {
 	}
 }
 
-// waitForArticleSync polls mgr.Status up to 3s waiting for cond to return
-// true for the "articles" config. Test fixtures all register a single
-// "articles" collection, so a hardcoded name keeps the helper terse.
+// waitForArticleSync polls mgr.Status up to 3s for cond on "articles" — the single
+// collection every fixture here registers.
 func waitForArticleSync(t *testing.T, mgr *manager.Manager, cond func(manager.ConfigStatus) bool) manager.Status {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

@@ -9,7 +9,6 @@ import (
 	"time"
 )
 
-// indexSnapshot holds a precomputed index.
 type indexSnapshot[K comparable, V any] struct {
 	index   map[K][]V
 	version Version
@@ -25,30 +24,16 @@ func WithIndexPersistence[T any, K comparable](p ViewPersistence) IndexedViewOpt
 	}
 }
 
-// WithIndexErrorHandler sets an error callback for persistence failures.
+// WithIndexErrorHandler sets the callback for this view's persistence failures and
+// recovered hook panics. See ErrorFunc.
 func WithIndexErrorHandler[T any, K comparable](fn ErrorFunc) IndexedViewOption[T, K] {
 	return func(v *IndexedView[T, K]) {
 		v.onError = fn
 	}
 }
 
-// IndexedView is an auto-updating view that groups collection items by a key.
-// It maintains a map[K][]V that recomputes when the source collection changes.
-//
-// Performance characteristics:
-//   - Reads (Get, Keys, Count): O(1) map lookup, lock-free via atomic.Pointer
-//   - Recompute: O(n) per source change — runs once per sync, not per read
-//   - Memory: one map[K][]T snapshot + the source snapshot
-//   - Persistence: async write after recompute (does not block reads)
-//
-// Example — group articles by category:
-//
-//	byCategory := config.NewIndexedView("by-category", articles,
-//	    func(a Article) string { return a.Category },
-//	)
-//
-//	techArticles := byCategory.Get("tech")     // []Article
-//	allCategories := byCategory.Keys()         // []string
+// IndexedView is an auto-updating map[K][]T grouping of a Collection, rebuilt on every
+// source change so that reads stay O(1) lookups against an immutable snapshot.
 type IndexedView[T any, K comparable] struct {
 	name               string
 	source             *Collection[T]
@@ -66,10 +51,8 @@ type IndexedView[T any, K comparable] struct {
 	hooks []func(old, new map[K][]T)
 }
 
-// NewIndexedView creates an auto-updating grouped view of a Collection.
-//
-// keyFn extracts the grouping key from each item.
-// The view maintains a map[K][]T that recomputes on every source change.
+// NewIndexedView creates an auto-updating grouped view of a Collection, with keyFn
+// extracting the grouping key from each item.
 func NewIndexedView[T any, K comparable](name string, source *Collection[T], keyFn func(T) K, opts ...IndexedViewOption[T, K]) *IndexedView[T, K] {
 	v := &IndexedView[T, K]{
 		name:   name,
@@ -87,15 +70,10 @@ func NewIndexedView[T any, K comparable](name string, source *Collection[T], key
 
 	v.data.Store(&indexSnapshot[K, T]{index: make(map[K][]T)})
 
-	// Try loading from persistence for warm start.
-	if v.persistence != nil {
-		v.loadFromPersistence()
+	if !keepWarmStart(v.loadFromPersistence(), source.Version()) {
+		v.recompute(source.All(), source.Version())
 	}
 
-	// Compute from current source data.
-	v.recompute(source.All(), source.Version())
-
-	// Auto-update on source changes.
 	v.unsub = source.OnChange(func(_, newItems []T) {
 		v.recompute(newItems, source.Version())
 	})
@@ -108,9 +86,7 @@ func (v *IndexedView[T, K]) Name() string {
 	return v.name
 }
 
-// Close unsubscribes the view from its source collection. After Close,
-// the view stops recomputing on source changes. It is safe to call
-// Close multiple times.
+// Close unsubscribes the view from its source; idempotent. Reads stay valid but go stale.
 func (v *IndexedView[T, K]) Close() {
 	v.closeOnce.Do(func() {
 		if v.unsub != nil {
@@ -119,8 +95,7 @@ func (v *IndexedView[T, K]) Close() {
 	})
 }
 
-// Get returns all items for the given key, or nil if the key doesn't exist.
-// O(1) map lookup + slice copy.
+// Get returns a copy of the items for the given key, or nil if the key doesn't exist.
 func (v *IndexedView[T, K]) Get(key K) []T {
 	items := v.data.Load().index[key]
 	if items == nil {
@@ -175,8 +150,7 @@ func (v *IndexedView[T, K]) Has(key K) bool {
 	return ok
 }
 
-// OnChange registers a callback that fires after the index recomputes.
-// Returns a function that removes the hook when called.
+// OnChange registers a callback fired after each regroup; the unregister is idempotent.
 func (v *IndexedView[T, K]) OnChange(fn func(old, new map[K][]T)) func() {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -195,13 +169,12 @@ func (v *IndexedView[T, K]) OnChange(fn func(old, new map[K][]T)) func() {
 }
 
 func (v *IndexedView[T, K]) recompute(items []T, version Version) {
-	// Pre-scan to estimate group sizes for better allocation.
+	// Count first so each group is allocated at its exact size; len/4 just seeds the counter.
 	keyCounts := make(map[K]int, len(items)/4+1)
 	for i := range items {
 		keyCounts[v.keyFn(items[i])]++
 	}
 
-	// Build index with pre-allocated slices.
 	index := make(map[K][]T, len(keyCounts))
 	for k, count := range keyCounts {
 		index[k] = make([]T, 0, count)
@@ -217,7 +190,7 @@ func (v *IndexedView[T, K]) recompute(items []T, version Version) {
 		version: version,
 	})
 
-	// Persist asynchronously with bounded concurrency.
+	// Async so a slow store never delays the swap chain.
 	if v.persistence != nil {
 		select {
 		case v.persistSem <- struct{}{}:
@@ -234,7 +207,7 @@ func (v *IndexedView[T, K]) recompute(items []T, version Version) {
 	hooks := v.hooks
 	v.mu.RUnlock()
 
-	// Defensive copies so hooks cannot mutate the internal snapshots.
+	// Copies, shared between hooks: they isolate the published snapshot, not each other.
 	oldCopy := copyIndex(old.index)
 	newCopy := copyIndex(index)
 
@@ -255,7 +228,6 @@ func (v *IndexedView[T, K]) recompute(items []T, version Version) {
 	}
 }
 
-// copyIndex returns a deep copy of an index map.
 func copyIndex[K comparable, V any](m map[K][]V) map[K][]V {
 	result := make(map[K][]V, len(m))
 	for k, items := range m {
@@ -294,24 +266,30 @@ func (v *IndexedView[T, K]) saveToPersistence(index map[K][]T) {
 	}
 }
 
-func (v *IndexedView[T, K]) loadFromPersistence() {
+// loadFromPersistence installs a stored index and reports whether it did.
+func (v *IndexedView[T, K]) loadFromPersistence() bool {
+	if v.persistence == nil {
+		return false
+	}
+
 	ctx, cancel := v.persistCtx()
 	defer cancel()
 
 	data, err := v.persistence.Load(ctx, v.name)
 	if err != nil || len(data) == 0 {
-		return
+		return false
 	}
 
 	var index map[K][]T
-	if err := json.Unmarshal(data, &index); err != nil {
-		return
+	if err := json.Unmarshal(data, &index); err != nil || index == nil {
+		return false
 	}
 
 	v.data.Store(&indexSnapshot[K, T]{index: index})
+
+	return true
 }
 
-// indexSnapshotT holds a transformed index.
 type indexSnapshotT[K comparable, V any] struct {
 	index   map[K][]V
 	version Version
@@ -327,31 +305,16 @@ func WithIndexTPersistence[T any, K comparable, V any](p ViewPersistence) Indexe
 	}
 }
 
-// WithIndexTErrorHandler sets an error callback for persistence failures.
+// WithIndexTErrorHandler sets an error callback for persistence failures; IndexedViewT has
+// no hooks, so no hook panics reach it.
 func WithIndexTErrorHandler[T any, K comparable, V any](fn ErrorFunc) IndexedViewTOption[T, K, V] {
 	return func(v *IndexedViewT[T, K, V]) {
 		v.onError = fn
 	}
 }
 
-// IndexedViewT is an auto-updating view that groups and transforms collection items.
-// It extracts a key and a value slice from each item, producing map[K][]V.
-//
-// Performance characteristics:
-//   - Reads: O(1) map lookup, lock-free
-//   - Recompute: O(n * m) where n=items, m=avg values per item — runs once per sync
-//   - Memory: one map[K][]V snapshot
-//   - Persistence: async write after recompute
-//
-// Example — map article names to their tags:
-//
-//	tagsByArticle := config.NewIndexedViewT("tags-by-article", articles,
-//	    func(a Article) string { return a.Name },
-//	    func(a Article) []Tag { return a.Tags },
-//	)
-//
-//	tutorialTags := tagsByArticle.Get("Go Tutorial") // []Tag
-//	count := tagsByArticle.CountFor("Rust Guide")
+// IndexedViewT is an auto-updating map[K][]V grouping of a Collection, extracting a key and
+// a value slice from each item. It has no OnChange — subscribe to the source instead.
 type IndexedViewT[T any, K comparable, V any] struct {
 	name               string
 	source             *Collection[T]
@@ -367,11 +330,8 @@ type IndexedViewT[T any, K comparable, V any] struct {
 	data atomic.Pointer[indexSnapshotT[K, V]]
 }
 
-// NewIndexedViewT creates a grouped, transformed view.
-//
-// keyFn extracts the grouping key from each source item.
-// valueFn extracts the values to collect under that key.
-// Values from all source items with the same key are concatenated.
+// NewIndexedViewT creates a grouped, transformed view: keyFn extracts the grouping key and
+// valueFn the values under it, concatenated across all source items sharing that key.
 func NewIndexedViewT[T any, K comparable, V any](name string, source *Collection[T], keyFn func(T) K, valueFn func(T) []V, opts ...IndexedViewTOption[T, K, V]) *IndexedViewT[T, K, V] {
 	v := &IndexedViewT[T, K, V]{
 		name:    name,
@@ -390,11 +350,9 @@ func NewIndexedViewT[T any, K comparable, V any](name string, source *Collection
 
 	v.data.Store(&indexSnapshotT[K, V]{index: make(map[K][]V)})
 
-	if v.persistence != nil {
-		v.loadFromPersistence()
+	if !keepWarmStart(v.loadFromPersistence(), source.Version()) {
+		v.recompute(source.All(), source.Version())
 	}
-
-	v.recompute(source.All(), source.Version())
 
 	v.unsub = source.OnChange(func(_, newItems []T) {
 		v.recompute(newItems, source.Version())
@@ -408,9 +366,7 @@ func (v *IndexedViewT[T, K, V]) Name() string {
 	return v.name
 }
 
-// Close unsubscribes the view from its source collection. After Close,
-// the view stops recomputing on source changes. It is safe to call
-// Close multiple times.
+// Close unsubscribes the view from its source; idempotent. Reads stay valid but go stale.
 func (v *IndexedViewT[T, K, V]) Close() {
 	v.closeOnce.Do(func() {
 		if v.unsub != nil {
@@ -419,7 +375,7 @@ func (v *IndexedViewT[T, K, V]) Close() {
 	})
 }
 
-// Get returns the values for the given key. O(1) lookup + slice copy.
+// Get returns a copy of the values for the given key, or nil if the key doesn't exist.
 func (v *IndexedViewT[T, K, V]) Get(key K) []V {
 	items := v.data.Load().index[key]
 	if items == nil {
@@ -475,14 +431,13 @@ func (v *IndexedViewT[T, K, V]) Has(key K) bool {
 }
 
 func (v *IndexedViewT[T, K, V]) recompute(items []T, version Version) {
-	// First pass: count total values per key for pre-allocation.
+	// Count first so each group is allocated at its exact size; len/4 just seeds the counter.
 	keyCounts := make(map[K]int, len(items)/4+1)
 	for i := range items {
 		key := v.keyFn(items[i])
 		keyCounts[key] += len(v.valueFn(items[i]))
 	}
 
-	// Second pass: build index with pre-allocated slices.
 	index := make(map[K][]V, len(keyCounts))
 	for k, count := range keyCounts {
 		index[k] = make([]V, 0, count)
@@ -540,19 +495,26 @@ func (v *IndexedViewT[T, K, V]) saveToPersistence(index map[K][]V) {
 	}
 }
 
-func (v *IndexedViewT[T, K, V]) loadFromPersistence() {
+// loadFromPersistence installs a stored index and reports whether it did.
+func (v *IndexedViewT[T, K, V]) loadFromPersistence() bool {
+	if v.persistence == nil {
+		return false
+	}
+
 	ctx, cancel := v.persistCtx()
 	defer cancel()
 
 	data, err := v.persistence.Load(ctx, v.name)
 	if err != nil || len(data) == 0 {
-		return
+		return false
 	}
 
 	var index map[K][]V
-	if err := json.Unmarshal(data, &index); err != nil {
-		return
+	if err := json.Unmarshal(data, &index); err != nil || index == nil {
+		return false
 	}
 
 	v.data.Store(&indexSnapshotT[K, V]{index: index})
+
+	return true
 }

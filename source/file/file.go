@@ -3,8 +3,6 @@
 // CI, local development, and end-to-end tests, where running a real CMS adds
 // friction without buying additional fidelity.
 //
-// Switch backends via env: DIRECTOR_SOURCE=filesystem → file; default → Directus.
-//
 // Example:
 //
 //	src := file.NewCollection[Product]("testdata/products.json")
@@ -46,9 +44,8 @@ func (c *Collection[T]) List(_ context.Context) ([]T, error) {
 	return out, nil
 }
 
-// LastModified returns the file's modification time. If the file does not
-// exist, it returns the zero time so the manager will retry on the next cycle
-// instead of treating absence as an error.
+// LastModified returns the file's modification time, or the zero time if the
+// file does not exist.
 func (c *Collection[T]) LastModified(_ context.Context) (time.Time, error) {
 	return statModTime(c.path)
 }
@@ -76,8 +73,8 @@ func (s *Singleton[T]) Get(_ context.Context) (*T, error) {
 	return &out, nil
 }
 
-// LastModified returns the file's modification time. If the file does not
-// exist, it returns the zero time so the manager will retry on the next cycle.
+// LastModified returns the file's modification time, or the zero time if the
+// file does not exist.
 func (s *Singleton[T]) LastModified(_ context.Context) (time.Time, error) {
 	return statModTime(s.path)
 }
@@ -121,12 +118,16 @@ func (k *KeyCollection[T]) List(_ context.Context) ([]T, error) {
 	return out, nil
 }
 
-// LastModified returns the file's modification time. If the file does not
-// exist, it returns the zero time so the manager will retry on the next cycle.
+// LastModified returns the file's modification time, or the zero time if the
+// file does not exist.
 func (k *KeyCollection[T]) LastModified(_ context.Context) (time.Time, error) {
 	return statModTime(k.path)
 }
 
+// statModTime reports a missing file as the zero time rather than an error: a
+// collection that has already loaded then keeps its data — the version check finds
+// nothing newer — instead of every poll cycle failing. A cold start still surfaces
+// the missing file, from List or Get.
 func statModTime(path string) (time.Time, error) {
 	info, err := os.Stat(path)
 	if err != nil {

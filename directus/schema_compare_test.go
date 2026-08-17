@@ -106,9 +106,8 @@ func TestCompareStruct_FlagsMissingField(t *testing.T) {
 }
 
 func TestCompareStruct_IgnoresHyphenAndUntaggedAndUnexported(t *testing.T) {
-	// Directus has "id" and "items" only — no "Skipped", "NoTag", "internal".
-	// Exotic-tag struct should match cleanly because skipped fields are out
-	// of scope and untagged fields are conservatively ignored.
+	// Directus declares "id" and "items" only; the struct's "Skipped", "NoTag" and
+	// "internal" are all out of scope, so nothing should be flagged.
 	fields := []directus.CollectionField{
 		{Field: "id", Type: directus.FieldTypeInteger},
 		{Field: "items", Type: directus.FieldTypeJSON},

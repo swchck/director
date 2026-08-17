@@ -2,8 +2,8 @@ package config
 
 import "time"
 
-// Version represents an opaque config version derived from Directus date_updated.
-// It uses RFC3339 format for deterministic comparison across replicas.
+// Version is an opaque config version, normally the source's last-modified timestamp. Equal
+// compares the raw RFC3339Nano string: byte-level agreement across replicas is the invariant.
 type Version struct {
 	raw string
 	t   time.Time
@@ -17,7 +17,8 @@ func NewVersion(t time.Time) Version {
 	}
 }
 
-// ParseVersion creates a Version from a raw RFC3339 string.
+// ParseVersion creates a Version from a raw RFC3339 string, keeping raw verbatim so
+// it round-trips through String unchanged.
 func ParseVersion(raw string) (Version, error) {
 	t, err := time.Parse(time.RFC3339Nano, raw)
 	if err != nil {
@@ -27,7 +28,7 @@ func ParseVersion(raw string) (Version, error) {
 	return Version{raw: raw, t: t}, nil
 }
 
-// String returns the RFC3339 representation.
+// String returns the raw RFC3339Nano representation.
 func (v Version) String() string {
 	return v.raw
 }
@@ -37,17 +38,19 @@ func (v Version) Time() time.Time {
 	return v.t
 }
 
-// IsZero reports whether the version is unset.
+// IsZero reports whether the version is unset. Other packages read that as "unknown
+// version, fetch unconditionally".
 func (v Version) IsZero() bool {
 	return v.raw == ""
 }
 
-// Equal reports whether two versions represent the same point in time.
+// Equal reports whether two versions have the same raw string; two spellings of one instant
+// are not Equal.
 func (v Version) Equal(other Version) bool {
 	return v.raw == other.raw
 }
 
-// After reports whether v is newer than other.
+// After reports whether v is newer than other, comparing parsed times rather than raw strings.
 func (v Version) After(other Version) bool {
 	return v.t.After(other.t)
 }

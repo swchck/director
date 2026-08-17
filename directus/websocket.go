@@ -11,18 +11,8 @@ import (
 	dlog "github.com/swchck/director/log"
 )
 
-// ChangeEvent represents a real-time subscription event from the Directus WebSocket.
-//
-// Directus sends events in the format:
-//
-//	{
-//	    "type": "subscription",
-//	    "event": "create",
-//	    "data": [{"id": 1, "name": "New Item", ...}],
-//	    "uid": "collection-uid"
-//	}
-//
-// Data contains the full item payloads as returned by the subscription query.
+// ChangeEvent is a real-time subscription event from the Directus WebSocket.
+// Collection is not on the wire — parseEvent recovers it from the subscription uid.
 type ChangeEvent struct {
 	Collection string          `json:"collection"`
 	Action     string          `json:"action"` // "create", "update", "delete"
@@ -33,8 +23,8 @@ type ChangeEvent struct {
 // WSSubscription configures a WebSocket subscription for a collection.
 type WSSubscription struct {
 	Collection string
-	// Query configures which fields and relations are included in event data.
-	// If nil, defaults to all fields (*).
+	// Query selects the fields and relations included in event data.
+	// If nil, no query is sent and Directus falls back to all fields.
 	Query *SubscriptionQuery
 }
 
@@ -46,11 +36,8 @@ type SubscriptionQuery struct {
 	Event []string `json:"event,omitempty"`
 }
 
-// WSClient is an optional WebSocket client for Directus real-time subscriptions.
-// It connects to the Directus WebSocket API and emits ChangeEvents when
-// items are created, updated, or deleted.
-//
-// This is an alternative to polling — use it for lower-latency change detection.
+// WSClient subscribes to Directus real-time item changes and emits ChangeEvents,
+// as a lower-latency alternative to polling.
 type WSClient struct {
 	baseURL string
 	token   string
@@ -71,10 +58,8 @@ func WithWSLogger(logger dlog.Logger) WSOption {
 	}
 }
 
-// NewWSClient creates a new WebSocket client for Directus real-time subscriptions.
-//
-// baseURL should be the root Directus URL (e.g. "https://directus.example.com").
-// The client will connect to the /websocket endpoint.
+// NewWSClient creates a client for Directus real-time subscriptions. baseURL is the
+// root Directus URL; the /websocket endpoint and wss:// scheme are derived from it.
 func NewWSClient(baseURL, token string, opts ...WSOption) *WSClient {
 	ws := &WSClient{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -89,10 +74,7 @@ func NewWSClient(baseURL, token string, opts ...WSOption) *WSClient {
 	return ws
 }
 
-// Subscribe connects to the Directus WebSocket and subscribes to changes
-// on the specified collections using default settings (all fields, all events).
-// Returns a channel that receives ChangeEvents.
-//
+// Subscribe watches collections with Directus defaults (all fields, all events).
 // The returned channel is closed when ctx is cancelled or Close is called.
 func (ws *WSClient) Subscribe(ctx context.Context, collections ...string) (<-chan ChangeEvent, error) {
 	subs := make([]WSSubscription, len(collections))
@@ -103,22 +85,8 @@ func (ws *WSClient) Subscribe(ctx context.Context, collections ...string) (<-cha
 	return ws.SubscribeWith(ctx, subs...)
 }
 
-// SubscribeWith connects to the Directus WebSocket and subscribes to changes
-// using detailed subscription configuration (custom fields, event filters).
-//
-// Example — subscribe with specific fields for relational data:
-//
-//	ws.SubscribeWith(ctx,
-//	    directus.WSSubscription{
-//	        Collection: "articles",
-//	        Query: &directus.SubscriptionQuery{
-//	            Fields: []string{"*", "translations.*", "owner.*"},
-//	        },
-//	    },
-//	    directus.WSSubscription{
-//	        Collection: "app_config",
-//	    },
-//	)
+// SubscribeWith is Subscribe with per-collection fields and event filters.
+// See docs/directus-package.md for an example.
 func (ws *WSClient) SubscribeWith(ctx context.Context, subs ...WSSubscription) (<-chan ChangeEvent, error) {
 	ws.mu.Lock()
 	if ws.closed {
@@ -143,7 +111,6 @@ func (ws *WSClient) SubscribeWith(ctx context.Context, subs ...WSSubscription) (
 	ws.cancel = cancel
 	ws.mu.Unlock()
 
-	// Authenticate.
 	authMsg := map[string]any{
 		"type":         "auth",
 		"access_token": ws.token,
@@ -155,16 +122,13 @@ func (ws *WSClient) SubscribeWith(ctx context.Context, subs ...WSSubscription) (
 		return nil, fmt.Errorf("directus: ws auth: %w", err)
 	}
 
-	// Read auth response.
 	if _, err := ws.readMessage(subCtx, conn); err != nil {
 		cancel()
 		_ = conn.Close(websocket.StatusNormalClosure, "auth failed")
 		return nil, fmt.Errorf("directus: ws auth response: %w", err)
 	}
 
-	// Subscribe to each collection with a uid for identification.
-	// Directus WS events don't include the collection name — they use uid to
-	// identify which subscription the event belongs to.
+	// Events carry only the subscription uid, so keep the mapping back.
 	uidToCollection := make(map[string]string, len(subs))
 
 	for _, sub := range subs {
@@ -246,8 +210,6 @@ func (ws *WSClient) readLoop(ctx context.Context, conn *websocket.Conn, ch chan<
 			return
 		}
 
-		// Directus sends {"type":"ping"} periodically to keep the connection alive.
-		// We must respond with {"type":"pong"} or the server closes the connection.
 		if ws.handlePing(ctx, conn, msg) {
 			continue
 		}
@@ -265,8 +227,8 @@ func (ws *WSClient) readLoop(ctx context.Context, conn *websocket.Conn, ch chan<
 	}
 }
 
-// handlePing checks if the message is a Directus ping and responds with pong.
-// Returns true if the message was a ping (and was handled).
+// handlePing answers Directus keepalives and reports whether msg was one. They are
+// JSON {"type":"ping"}, not WS frames, and go unanswered at the cost of the connection.
 func (ws *WSClient) handlePing(ctx context.Context, conn *websocket.Conn, msg []byte) bool {
 	var envelope struct {
 		Type string `json:"type"`
@@ -309,7 +271,6 @@ func (ws *WSClient) parseEvent(raw []byte, uidMap map[string]string) (ChangeEven
 		return ChangeEvent{}, false
 	}
 
-	// Resolve collection from uid.
 	collection := uidMap[msg.UID]
 
 	return ChangeEvent{

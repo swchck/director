@@ -14,28 +14,12 @@ type SchemaDrift struct {
 	// JSONTag is the json tag value used to map onto Directus (e.g. "title").
 	JSONTag string
 
-	// Reason is a short machine-readable code describing the mismatch.
-	// Currently only "missing_in_directus" is emitted.
+	// Reason is a machine-readable code; only "missing_in_directus" is emitted today.
 	Reason string
 }
 
-// CompareStruct reflects sample (a zero-value struct of the type backing a
-// collection) against fields fetched from Directus and returns drifts where
-// a Go-declared field is absent from the Directus schema.
-//
-// Only the missing-field direction is reported. Fields that exist in
-// Directus but not in Go are silently ignored — they're typically intentional
-// (admin-only fields, system metadata, etc.).
-//
-// Rules:
-//   - Unexported fields are skipped.
-//   - Fields with no `json` tag are skipped (no contract to compare).
-//   - Tag value "-" is skipped (explicit opt-out).
-//   - Embedded structs are not flattened — the embed itself is checked
-//     against Directus by its declared json tag if any.
-//
-// Pass either a struct value or a pointer to a struct. Returns nil if sample
-// is not a struct.
+// CompareStruct reports json-tagged fields of sample (a struct or pointer to one)
+// that Directus does not declare. Direction and skip rules: docs/directus-package.md.
 func CompareStruct(fields []CollectionField, sample any) []SchemaDrift {
 	t := reflect.TypeOf(sample)
 	if t == nil {

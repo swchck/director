@@ -159,9 +159,8 @@ func (c *Client) DeletePolicy(ctx context.Context, id string) error {
 	return c.Delete(ctx, "policies/"+id)
 }
 
-// GrantAdminAccess finds the admin policy by name and sets admin_access=true.
-// This is a convenience for Directus 11 where the bootstrap may not set admin_access
-// on the Administrator policy.
+// GrantAdminAccess sets admin_access on the policy named "Administrator", which the
+// Directus 11 bootstrap may leave off. No-op if it is absent or already granted.
 func (c *Client) GrantAdminAccess(ctx context.Context) error {
 	policies, err := c.ListPolicies(ctx)
 	if err != nil {
@@ -258,8 +257,8 @@ func (c *Client) DeletePermission(ctx context.Context, id int) error {
 	return c.Delete(ctx, fmt.Sprintf("permissions/%d", id))
 }
 
-// GrantFullAccess creates CRUD permissions for a collection on a policy.
-// This grants create, read, update, and delete access with no field restrictions.
+// GrantFullAccess creates CRUD permissions for a collection on a policy, with no
+// field restrictions.
 func (c *Client) GrantFullAccess(ctx context.Context, policyID, collection string) error {
 	for _, action := range []PermissionAction{ActionCreate, ActionRead, ActionUpdate, ActionDelete} {
 		_, err := c.CreatePermission(ctx, Permission{

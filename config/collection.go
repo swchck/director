@@ -5,19 +5,13 @@ import (
 	"sync/atomic"
 )
 
-// collectionSnapshot holds an immutable point-in-time view of a collection's items.
 type collectionSnapshot[T any] struct {
 	version Version
 	items   []T
 }
 
-// Collection is a thread-safe, queryable in-memory store for a Directus collection
-// that contains multiple items.
-//
-// Read methods (All, First, Find, FindMany, Filter) are lock-free and safe for
-// concurrent use. User-provided predicate and comparison functions passed to
-// Find, FindMany, and Filter must not panic — if they do, the panic will
-// propagate to the caller. Ensure predicate functions handle all edge cases.
+// Collection is a thread-safe, queryable in-memory store for a collection of items.
+// Reads are lock-free; predicates passed to them run unrecovered on the caller's goroutine.
 type Collection[T any] struct {
 	name string
 	data atomic.Pointer[collectionSnapshot[T]]
@@ -26,7 +20,7 @@ type Collection[T any] struct {
 	hooks []func(old, new []T)
 }
 
-// NewCollection creates a new Collection config for the named Directus collection.
+// NewCollection creates an empty Collection under the given source collection name.
 func NewCollection[T any](name string) *Collection[T] {
 	c := &Collection[T]{name: name}
 	c.data.Store(&collectionSnapshot[T]{})
@@ -34,7 +28,7 @@ func NewCollection[T any](name string) *Collection[T] {
 	return c
 }
 
-// Name returns the Directus collection name.
+// Name returns the source collection name.
 func (c *Collection[T]) Name() string {
 	return c.name
 }
@@ -70,8 +64,6 @@ func (c *Collection[T]) First() (T, bool) {
 }
 
 // Find returns the first item matching the predicate, or false if none match.
-//
-// The predicate must not panic. If it does, the panic propagates to the caller.
 func (c *Collection[T]) Find(predicate func(T) bool) (T, bool) {
 	for _, item := range c.data.Load().items {
 		if predicate(item) {
@@ -84,8 +76,6 @@ func (c *Collection[T]) Find(predicate func(T) bool) (T, bool) {
 }
 
 // FindMany returns all items matching the predicate.
-//
-// The predicate must not panic. If it does, the panic propagates to the caller.
 func (c *Collection[T]) FindMany(predicate func(T) bool) []T {
 	var result []T
 	for _, item := range c.data.Load().items {
@@ -98,19 +88,12 @@ func (c *Collection[T]) FindMany(predicate func(T) bool) []T {
 }
 
 // Filter applies a chain of filter options (Where, SortBy, Limit, Offset) and returns the result.
-//
-// User-provided functions in filter options must not panic.
-// If they do, the panic propagates to the caller.
 func (c *Collection[T]) Filter(opts ...FilterOption[T]) []T {
 	return applyFilters(c.data.Load().items, opts)
 }
 
-// OnChange registers a callback that fires after items are swapped.
-// The callback receives copies of the old and new item slices.
-// Returns a function that removes the hook when called.
-//
-// If a callback panics during Swap, the panic is recovered and returned as an error.
-// The data swap itself is already committed before hooks run.
+// OnChange registers a callback fired after each Swap with copies of the old and new
+// slices; a panic in it becomes a Swap error. The returned unregister is idempotent.
 func (c *Collection[T]) OnChange(fn func(old, new []T)) func() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -128,11 +111,8 @@ func (c *Collection[T]) OnChange(fn func(old, new []T)) func() {
 	}
 }
 
-// Swap replaces the current items with a new version and fires OnChange hooks.
-// This method is intended for use by the manager package.
-//
-// The atomic swap always succeeds. If an OnChange hook panics, the panic is
-// recovered and returned as an error. The data will already reflect the new version.
+// Swap sets a new version and items, then fires OnChange hooks. It publishes the snapshot
+// before any hook runs, so an error means a hook panicked, never that the old data is live.
 func (c *Collection[T]) Swap(version Version, items []T) error {
 	stored := make([]T, len(items))
 	copy(stored, items)
@@ -146,7 +126,7 @@ func (c *Collection[T]) Swap(version Version, items []T) error {
 	hooks := c.hooks
 	c.mu.RUnlock()
 
-	// Defensive copies so hooks cannot mutate the internal snapshots.
+	// Copies, shared between hooks: they isolate the published snapshot, not each other.
 	oldCopy := make([]T, len(old.items))
 	copy(oldCopy, old.items)
 	newCopy := make([]T, len(stored))

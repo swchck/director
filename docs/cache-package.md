@@ -99,7 +99,7 @@ view := config.NewView("food-sorted", businesses, filters,
 ### How it works
 
 - When a View recomputes (triggered by Collection.Swap), it saves the filtered/sorted result to Redis **asynchronously**
-- On View creation, it attempts to load from Redis for a warm start
+- On View creation, it attempts to load from Redis for a warm start, which stands only until the source collection has a version of its own
 - Other replicas with the same view name can read the precomputed result without re-running the filter pipeline
 
 ### Key format

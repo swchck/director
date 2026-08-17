@@ -22,10 +22,8 @@ type Client struct {
 	logger     dlog.Logger
 }
 
-// NewClient creates a new Directus REST client.
-//
-// baseURL is the root URL of the Directus instance (e.g. "https://directus.example.com").
-// token is a static access token used for authentication.
+// NewClient creates a Directus REST client against the instance root baseURL,
+// authenticating every request with the static access token.
 func NewClient(baseURL, token string, opts ...ClientOption) *Client {
 	c := &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
@@ -38,7 +36,6 @@ func NewClient(baseURL, token string, opts ...ClientOption) *Client {
 		opt(c)
 	}
 
-	// Wrap the transport with auth.
 	transport := c.httpClient.Transport
 	if transport == nil {
 		transport = http.DefaultTransport
@@ -119,7 +116,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		return nil, c.parseError(resp.StatusCode, respBody)
 	}
 
-	// DELETE with 204 has no body.
+	// A 204 (typical for DELETE) carries no envelope to unwrap.
 	if resp.StatusCode == http.StatusNoContent || len(respBody) == 0 {
 		return nil, nil
 	}
